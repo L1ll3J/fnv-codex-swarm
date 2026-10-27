@@ -139,8 +139,13 @@ def prepare(report, source_path, flags, *, call=service, invoke=subprocess.run):
         ]
         versions = {str(p): digest(p) for p in (selected["checker"]).glob("*.py")}
         versions.update(pack_files(claim))
+        from .toolchains import files as compiler_files
+
+        versions.update(compiler_files(selected.get("toolchains", {})))
         for path in [
-            Path.home() / "fnvdecomp/tools/msvc9/VC/bin/cl.exe",
+            Path(selected["toolchains"]["sp1"]["root"]) / "VC/bin/cl.exe"
+            if selected.get("toolchains", {}).get("sp1")
+            else Path.home() / "fnvdecomp/tools/msvc9/VC/bin/cl.exe",
             Path(
                 assignment.get("resource_paths", {}).get(
                     "game_image", str(Path.home() / "fnvdecomp/game/FalloutNV.exe")
@@ -154,7 +159,12 @@ def prepare(report, source_path, flags, *, call=service, invoke=subprocess.run):
             "MATCH  (under your --flags, not the pack's %s: the site does not accept this yet. To report it, save this code with checkpoint and flag the function with compile_flags and checkpoint_id)"
             % " ".join(pack["flags"])
         )
-        if result.returncode != 0 or result.stdout.splitlines()[0:1] != [expected]:
+        from .checker_result import RTM_SUFFIX
+
+        lines = result.stdout.splitlines()
+        first = lines[0] if lines else ""
+        rtm_expected = "MATCH" + RTM_SUFFIX + expected[len("MATCH") :]
+        if result.returncode != 0 or first not in (expected, rtm_expected):
             raise ValueError(
                 "Alternate flags did not establish an official proof MATCH; diagnostics retained"
             )

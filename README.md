@@ -86,3 +86,22 @@ installation of this updater still requires the usual explicit package upgrade.
 Published Git tags trigger the release workflow, which builds the wheel and its
 manifest. This is application code from the configured repository, not arbitrary
 URLs supplied by a worker or report.
+
+
+### VC++ 2008 RTM fallback
+
+The audited 27 October checker generation supports SP1 15.00.30729.01 and
+RTM 15.00.21022.08. Install RTM separately; never overwrite SP1. By default the
+app looks for `~/fnvdecomp/tools/msvc9` and the optional sibling `msvc9rtm`.
+Override these roots with an owner-controlled `compiler-toolchains.json` in
+the app state directory, for example `{"sp1":"/tools/msvc9","rtm":"/tools/msvc9rtm"}`.
+New assignment generations record compiler versions and core component hashes;
+existing assignments retain their recorded environment. An unrecorded ambient
+`FNVCHECK_RTM_ROOT` cannot silently enable fallback on an older assignment.
+
+The recorder reserves up to twenty internal compiler calls per accepted flag
+set for this generation, covering both compilers' repair passes. Profile round
+and candidate-check settings remain unchanged. Official annotated RTM MATCH
+results still require independent plain validation against the original pack.
+The upstream fallback returns RTM diagnostics only for exact matches; partial
+RTM improvements are not exposed by its ordinary output.

@@ -335,16 +335,19 @@ def test_new_recorder_never_reports_a_repaired_rejection_as_free(tmp_path):
     ):
         shutil.copy2(TEMPLATE / name, tmp_path / name)
     configure_tools(tmp_path)
+    validator = (tmp_path / "validate_submit.py").read_text()
+    assert "pathlib.Path(tool_context['toolchains']['sp1']['root'])" in validator
+    assert "compiler_files(tool_context.get('toolchains',{}))" in validator
     fn = next(
         n
         for n in ast.parse((tmp_path / "recorded_fnv_check_v2.py").read_text()).body
         if isinstance(n, ast.FunctionDef) and n.name == "compiler_bounds"
     )
-    scope = {"MAX_COMPILERS_PER_CHECK": 10}
+    scope = {"MAX_COMPILERS_PER_CHECK": 20}
     exec(
         compile(ast.Module(body=[fn], type_ignores=[]), "<generated bounds>", "exec"),
         scope,
     )
     assert scope["compiler_bounds"](
         {"status": "rejected", "errors": ["AUTO-REPAIR: removed duplicate function"]}
-    ) == (0, 10)
+    ) == (0, 20)

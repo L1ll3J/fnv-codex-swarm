@@ -53,17 +53,31 @@ def tree(root):
 
 
 def audit(checker):
-    for name, expected in COMPILE_COMPONENTS.items():
-        if not (checker / name).is_file() or digest(checker / name) != expected:
-            raise ValueError(
-                "New compiler adapter requires accounting compatibility review: " + name
-            )
-    key = (digest(checker / "fnvcheck.py"), digest(checker / "fc_check.py"))
-    if key not in AUDITS:
+    names = ("fnvcheck.py", "fc_check.py", "fc_common.py", "msvc9.py")
+    if any(not (checker / name).is_file() for name in names):
+        raise ValueError("Missing official compiler adapter; no admission")
+    key = tuple(digest(checker / name) for name in names)
+    known = {
+        (
+            *pair,
+            COMPILE_COMPONENTS["fc_common.py"],
+            COMPILE_COMPONENTS["msvc9.py"],
+        ): bound
+        for pair, bound in AUDITS.items()
+    }
+    known[
+        (
+            "a4e945c44b49f02ab007a3e4ae4cafc5896a2ec2ca3147d048017bb578859cfb",
+            "8a3e6353bc82ab3537a4967d5702e6139654eb2b6f75851fbf91a684cbd0c78b",
+            "0e3628d9b9ad27fd4adf9c8218c0a569e0e27c294e11ffe6f377767ec9962db5",
+            COMPILE_COMPONENTS["msvc9.py"],
+        )
+    ] = 20
+    if key not in known:
         raise ValueError(
             "New official checker downloaded; compilation accounting compatibility review required before admission"
         )
-    return AUDITS[key]
+    return known[key]
 
 
 def validate(snapshot):
@@ -85,6 +99,9 @@ def validate(snapshot):
         for name, value in manifest["files"].items()
     ):
         raise ValueError("Official data generation changed")
+    from .toolchains import validate as validate_toolchains
+
+    validate_toolchains(manifest.get("toolchains", {}))
     return directory
 
 
@@ -146,6 +163,10 @@ def current(root, download=None, *, now=None, force=False, compatibility=audit):
                     "checker": tree(stage / "fnvcheck"),
                     "compiler_calls_per_flag_set": bound,
                 }
+                if bound >= 20:
+                    from .toolchains import discover
+
+                    manifest["toolchains"] = discover(state)
                 identifier = hashlib.sha256(
                     json.dumps(manifest, sort_keys=True).encode()
                 ).hexdigest()
@@ -240,17 +261,25 @@ def context(assignment):
             p.name: digest(p) for p in (directory / "fnvcheck").glob("*.py")
         },
         "bound": assignment["official_internal_retry_bound"],
+        "toolchains": snapshot["manifest"].get("toolchains", {}),
     }
 
 
 def environment(value, claim):
     directory = value["directory"]
+    compilers = value.get("toolchains", {})
+    variables = []
+    if compilers:
+        variables.append("FNV_MSVC9_ROOT=" + compilers["sp1"]["root"])
+    # Never silently enable an unrecorded ambient fallback on a legacy assignment.
+    variables.append("FNVCHECK_RTM_ROOT=" + compilers.get("rtm", {}).get("root", ""))
     return [
         "PYTHONDONTWRITEBYTECODE=1",
         "FNVCHECK_TOOLS=" + str(value["checker"]),
         "FNVCHECK_INDEX=" + str(directory / "function_index.json"),
         "FNVCHECK_SYMBOLS=" + str(directory / "fnvdecomp_symbols.json"),
         "FNVCHECK_CACHE=" + str(Path(claim) / "work/tool-cache"),
+        *variables,
     ]
 
 
