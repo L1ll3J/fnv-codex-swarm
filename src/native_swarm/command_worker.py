@@ -111,35 +111,80 @@ def _stop_tree(claim, grace=10):
         if children <= known:
             break
         known |= children
-    handles = []
+    handles = {}
+    sessions = set()
+    deadline = time.monotonic() + max(5, grace)
     try:
-        for pid in known:
-            try:
-                fd = os.pidfd_open(pid)
-                if process_snapshot().get(pid) != snapshot.get(pid):
-                    os.close(fd)
-                    raise RuntimeError("Worker process identity changed during stop.")
-                handles.append(fd)
-            except ProcessLookupError:
-                pass
-        for fd in handles:
-            try:
-                signal.pidfd_send_signal(fd, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        deadline = time.monotonic() + grace
-        for fd in handles:
-            if not select.select([fd], [], [], max(0, deadline - time.monotonic()))[0]:
+        # Freeze before terminating: TERM handlers and concurrent model/tool
+        # forks must not create children after the final ownership snapshot.
+        while True:
+            for pid in sorted(known, key=lambda p: p not in roots):
+                if pid in handles:
+                    continue
                 try:
-                    signal.pidfd_send_signal(fd, signal.SIGKILL)
+                    fd = os.pidfd_open(pid)
                 except ProcessLookupError:
-                    pass
-                if not select.select([fd], [], [], 5)[0]:
-                    raise RuntimeError(
-                        "A worker process has not exited; release withheld."
-                    )
+                    continue
+                try:
+                    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+                    if fields[19] != snapshot[pid][1]:
+                        raise RuntimeError("Worker process identity changed during stop.")
+                    handles[pid] = fd
+                    if int(fields[3]) == pid:
+                        sessions.add(pid)
+                    signal.pidfd_send_signal(fd, signal.SIGSTOP)
+                except (FileNotFoundError, ProcessLookupError):
+                    if pid not in handles:
+                        os.close(fd)
+                except BaseException:
+                    if pid not in handles:
+                        os.close(fd)
+                    raise
+            # Once every observed member is frozen, descendants cannot fork
+            # past the next snapshot. Private sessions retain reparented tools.
+            frozen = True
+            for pid, fd in handles.items():
+                if select.select([fd], [], [], 0)[0]:
+                    continue
+                try:
+                    phase = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+                except FileNotFoundError:
+                    continue
+                if phase not in ("T", "t", "Z"):
+                    frozen = False
+            latest = process_snapshot()
+            added = {pid for pid, (ppid, _) in latest.items() if ppid in known}
+            for pid in latest:
+                try:
+                    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+                    if int(fields[3]) in sessions:
+                        added.add(pid)
+                except (OSError, ValueError, IndexError):
+                    continue
+            added -= known
+            if frozen and not added:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Worker process tree did not freeze; release withheld.")
+            known |= added
+            snapshot.update({pid: latest[pid] for pid in added})
+            time.sleep(0.01)
+        for fd in handles.values():
+            try:
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        for fd in handles.values():
+            if not select.select([fd], [], [], 5)[0]:
+                raise RuntimeError("A worker process has not exited; release withheld.")
     finally:
-        for fd in handles:
+        for fd in handles.values():
+            # On an interrupted or failed freeze, leave no observed worker
+            # suspended indefinitely; a successful KILL makes CONT harmless.
+            try:
+                signal.pidfd_send_signal(fd, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
             os.close(fd)
     # Orphaned member processes must not be guessed dead.
     session = read(claim / "session/state.json")
@@ -151,6 +196,24 @@ def _stop_tree(claim, grace=10):
             raise RuntimeError(
                 "An orphaned worker remains; inspect its process before release."
             )
+    private_sessions = sessions | {
+        pid for pid in (
+            [t.get("pid") for t in session.get("turns", [])]
+            + [m.get("pid") for m in group.get("members", [])]
+            + list(handoff_pids)
+        ) if pid
+    }
+    for path in Path("/proc").iterdir():
+        if not path.name.isdecimal():
+            continue
+        try:
+            fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
+            if fields[0] != "Z" and int(fields[3]) in private_sessions:
+                raise RuntimeError(
+                    "An owned private session still has a live process; termination needs reconciliation before release."
+                )
+        except (FileNotFoundError, ProcessLookupError):
+            continue
     if handoff.get("intent") and not handoff.get("finished"):
         atomic(
             claim / "operator-handoff-process.json",

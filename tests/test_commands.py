@@ -1063,3 +1063,62 @@ def test_operator_release_never_publishes_unverified_candidate_attribution(tmp_p
     assert "best_code" not in payloads[0]
     assert "model" not in payloads[0]
     assert read(claim / "operator-handoff.json")["best_receipt"]
+
+
+def test_stop_freezes_tree_before_handlers_can_spawn_descendants(tmp_path):
+    import signal
+    import subprocess
+    import sys
+
+    _, run, claim = fixture(tmp_path)
+    spawned = tmp_path / "handler-child"
+    code = (
+        "import signal,subprocess,sys,time; from pathlib import Path; "
+        f"signal.signal(signal.SIGTERM,lambda *_:Path({str(spawned)!r}).write_text(str(subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']).pid))); "
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+        "print(child.pid,flush=True); time.sleep(60)"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", code, str(run), claim.name], stdout=subprocess.PIPE, text=True, start_new_session=True)
+    child = int(proc.stdout.readline())
+    try:
+        atomic(run / "rolling-executor/journal.json", {"jobs": {"worker": {"claim_id": claim.name, "pid": proc.pid}}})
+        worker.stop_tree(claim, grace=0.01)
+        assert proc.wait(timeout=3) == -signal.SIGKILL
+        assert not spawned.exists()
+        path = Path(f"/proc/{child}/stat")
+        assert not path.exists() or path.read_text().rsplit(")", 1)[1].split()[0] == "Z"
+        assert read(claim / "operator-stop-terminal.json")["verified_stopped"]
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=3)
+        proc.stdout.close()
+        import os
+        try:
+            os.kill(child, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_stop_withholds_terminal_marker_for_orphaned_private_session(tmp_path):
+    import os
+    import signal
+    import subprocess
+    import sys
+
+    _, run, claim = fixture(tmp_path)
+    code = "import subprocess,sys; print(subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],stdout=subprocess.DEVNULL).pid,flush=True)"
+    proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True, start_new_session=True)
+    child = int(proc.stdout.readline())
+    proc.wait(timeout=3)
+    try:
+        atomic(claim / "session/state.json", {"turns": [{"pid": proc.pid}]})
+        with pytest.raises(RuntimeError, match="private session still has a live process"):
+            worker.stop_tree(claim, grace=0.01)
+        assert not (claim / "operator-stop-terminal.json").exists()
+    finally:
+        proc.stdout.close()
+        try:
+            os.kill(child, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
