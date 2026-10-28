@@ -92,13 +92,13 @@ def test_queue_skips_incompatible_size_without_reserving_it(tmp_path):
                 "id": "big",
                 "profile_id": None,
                 "state": "queued",
-                "target": {"bytes": 900},
+                "target": {"bytes": 900, "address": "0x900"},
             },
             {
                 "id": "small",
                 "profile_id": None,
                 "state": "queued",
-                "target": {"bytes": 50},
+                "target": {"bytes": 50, "address": "0x50"},
             },
         ],
     )

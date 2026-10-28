@@ -49,12 +49,24 @@ class ProfileEditor(ModalScreen):
             yield Input(p["name"], id="profile-name", placeholder="Name")
             yield Label("Concurrent functions / groups · 0 = no slots assigned")
             yield Input(str(p["instances"]), type="integer", id="profile-instances")
-            yield Label("Agents per function · 1 = independent, 2–4 = generalist team")
+            yield Label("Agents per function · configurable within your total capacity")
             yield Select(
-                [(str(n), n) for n in range(1, 5)],
+                [
+                    (str(n), n)
+                    for n in range(1, max(self.capacity, p["group_size"]) + 1)
+                ],
                 value=p["group_size"],
                 allow_blank=False,
                 id="profile-group",
+            )
+            yield Select(
+                [
+                    ("Collaborate and share findings", "collaborative"),
+                    ("Isolated independent agents", "isolated"),
+                ],
+                value=p.get("team_mode", "collaborative"),
+                allow_blank=False,
+                id="profile-mode",
             )
             yield Static("", id="profile-allocation", markup=False)
             yield Label("Batch rounds per function · each round permits 1–8 candidates")
@@ -123,6 +135,7 @@ class ProfileEditor(ModalScreen):
                     name=self.query_one("#profile-name", Input).value,
                     instances=int(self.query_one("#profile-instances", Input).value),
                     group_size=self.query_one("#profile-group", Select).value,
+                    team_mode=self.query_one("#profile-mode", Select).value,
                     rounds=int(self.query_one("#profile-rounds", Input).value),
                     extend_while_improving=self.query_one(
                         "#profile-extend", Checkbox
@@ -334,3 +347,265 @@ class FlagEditor(ModalScreen):
                 self.dismiss(current)
         except (ValueError, OSError, subprocess.TimeoutExpired) as error:
             self.query_one("#flag-error", Static).update(str(error))
+
+
+class CommandEditor(ModalScreen):
+    """One explicit command form for worker, profile and global scopes."""
+
+    CSS = """
+    CommandEditor { align: center middle; }
+    #command-form { width: 78; height: 90%; border: thick $primary; background: $surface; padding: 1 2; }
+    #command-form Select, #command-form Input { margin-bottom: 1; }
+    """
+
+    def __init__(self, profiles):
+        super().__init__()
+        self.profiles = profiles
+
+    def compose(self):
+        with VerticalScroll(id="command-form"):
+            yield Label("Operator command · evidence is preserved before release")
+            yield Select(
+                [
+                    ("Selected worker", "selected"),
+                    ("Marked workers", "marked"),
+                    ("All open workers / claims", "all"),
+                ]
+                + [("Profile: " + p["name"], p["id"]) for p in self.profiles],
+                value="selected",
+                allow_blank=False,
+                id="command-scope",
+            )
+            yield Select(
+                [
+                    ("Stop now and release", "stop_now"),
+                    ("Finish current round, then release", "finish_round"),
+                    ("Stop, request bounded handoff, then release", "handoff"),
+                    ("Pause profile admissions", "pause_profile"),
+                    ("Resume profile admissions", "resume_profile"),
+                    (
+                        "Acknowledge selected controller hold; allow replacement",
+                        "acknowledge",
+                    ),
+                    ("Reconcile command / retry confirmed open release", "retry"),
+                ],
+                value="stop_now",
+                allow_blank=False,
+                id="command-action",
+            )
+            yield Checkbox("Refill freed slots", value=False, id="command-refill")
+            yield Select(
+                [
+                    ("Handoff if improved", "improved"),
+                    ("Always request handoff", "always"),
+                    ("Mechanical preservation only", "never"),
+                ],
+                value="improved",
+                allow_blank=False,
+                id="command-handoff",
+            )
+            yield Label("Agent handoff timeout (seconds)")
+            yield Input("45", type="integer", id="command-timeout")
+            yield Static(
+                "Immediate Stop never waits for an agent. MATCH evidence goes through the independent submission gate. An uncertain release requires explicit reconciliation.",
+                markup=False,
+            )
+            yield Static("", id="command-error", markup=False)
+            with Horizontal(classes="toolbar"):
+                yield Button("Execute", id="command-save", variant="warning")
+                yield Button("Cancel", id="command-cancel")
+
+    def on_button_pressed(self, event):
+        event.stop()
+        if event.button.id == "command-cancel":
+            self.dismiss(None)
+        elif event.button.id == "command-save":
+            try:
+                timeout = int(self.query_one("#command-timeout", Input).value)
+                if not 1 <= timeout <= 600:
+                    raise ValueError("Timeout must be 1–600 seconds.")
+                self.dismiss(
+                    {
+                        "scope": self.query_one("#command-scope", Select).value,
+                        "action": self.query_one("#command-action", Select).value,
+                        "replace": self.query_one("#command-refill", Checkbox).value,
+                        "handoff": self.query_one("#command-handoff", Select).value,
+                        "timeout": timeout,
+                    }
+                )
+            except ValueError as exc:
+                self.query_one("#command-error", Static).update(str(exc))
+
+
+class TargetEditor(ModalScreen):
+    CSS = """
+    TargetEditor { align: center middle; }
+    #target-form { width: 74; height: 85%; border: thick $primary; background: $surface; padding: 1 2; }
+    """
+
+    def __init__(self, profiles):
+        super().__init__()
+        self.profiles = profiles
+
+    def compose(self):
+        with VerticalScroll(id="target-form"):
+            yield Label("Queue a function directly")
+            yield Input(placeholder="0x00ea3d60", id="target-address")
+            yield Input(
+                placeholder="Bytes (e.g. 14124)", type="integer", id="target-size"
+            )
+            yield Select(
+                [("Any profile", "*")] + [(p["name"], p["id"]) for p in self.profiles],
+                value="*",
+                allow_blank=False,
+                id="target-profile",
+            )
+            yield Select(
+                [
+                    ("Open · other profiles may select it", "open"),
+                    (
+                        "Preferred · queue here, other profiles may select it",
+                        "preferred",
+                    ),
+                    ("Exclusive · only selected profile", "exclusive"),
+                ],
+                value="open",
+                allow_blank=False,
+                id="target-route",
+            )
+            yield Checkbox(
+                "Prioritize this target even when Queue first is off",
+                value=True,
+                id="target-immediate",
+            )
+            yield Static(
+                "Multiple agents on one function: choose agents/function and isolated or collaborative mode in its profile. Changing a route does not take a live claim away from its current worker.",
+                markup=False,
+            )
+            yield Static("", id="target-error", markup=False)
+            with Horizontal(classes="toolbar"):
+                yield Button("Queue target", id="target-save", variant="primary")
+                yield Button("Cancel", id="target-cancel")
+
+    def on_button_pressed(self, event):
+        event.stop()
+        if event.button.id == "target-cancel":
+            self.dismiss(None)
+        elif event.button.id == "target-save":
+            try:
+                self.dismiss(
+                    {
+                        "address": self.query_one("#target-address", Input)
+                        .value.strip()
+                        .lower(),
+                        "size": int(self.query_one("#target-size", Input).value),
+                        "profile": None
+                        if self.query_one("#target-profile", Select).value == "*"
+                        else self.query_one("#target-profile", Select).value,
+                        "mode": self.query_one("#target-route", Select).value,
+                        "immediate": self.query_one(
+                            "#target-immediate", Checkbox
+                        ).value,
+                    }
+                )
+            except ValueError as exc:
+                self.query_one("#target-error", Static).update(str(exc))
+
+
+class AssessorEditor(ModalScreen):
+    CSS = """
+    AssessorEditor { align: center middle; }
+    #assessor-form { width: 74; height: 85%; border: thick $primary; background: $surface; padding: 1 2; }
+    """
+
+    def __init__(self, settings):
+        super().__init__()
+        self.settings = settings
+
+    def compose(self):
+        s = self.settings
+        with VerticalScroll(id="assessor-form"):
+            yield Label(
+                "Fresh assessor per report · separate capacity from reconstruction"
+            )
+            yield Checkbox(
+                "Automatically assess new reports",
+                value=s.get("enabled", False),
+                id="assessor-enabled",
+            )
+            yield Select(
+                [(m, m) for m in MODELS],
+                value=s.get("model", "gpt-6.1-sol"),
+                allow_blank=False,
+                id="assessor-model",
+            )
+            yield Select(
+                [(e, e) for e in ("low", "medium", "high", "xhigh", "max")],
+                value=s.get("effort", "medium"),
+                allow_blank=False,
+                id="assessor-effort",
+            )
+            yield Label("Concurrent assessments")
+            yield Input(
+                str(s.get("capacity", 1)), type="integer", id="assessor-capacity"
+            )
+            yield Select(
+                [
+                    ("Stop queuing; finish active", "stop_queuing"),
+                    ("Taper admissions", "taper"),
+                    ("Stop active assessments at cutoff", "stop_immediately"),
+                ],
+                value=s.get("usage_policy", {}).get("mode", "stop_queuing"),
+                allow_blank=False,
+                id="assessor-policy",
+            )
+            yield Label("Taper starts (% used)")
+            yield Input(
+                str(s.get("usage_policy", {}).get("taper_start_used_percent", 80)),
+                type="number",
+                id="assessor-taper",
+            )
+            yield Label("Assessor cutoff (% used)")
+            yield Input(
+                str(s.get("usage_policy", {}).get("cutoff_used_percent", 100)),
+                type="number",
+                id="assessor-cutoff",
+            )
+            yield Static(
+                "No model remains running while the report queue is empty. Assessor decisions are local; external flags require your confirmation.",
+                markup=False,
+            )
+            yield Static("", id="assessor-error", markup=False)
+            with Horizontal(classes="toolbar"):
+                yield Button(
+                    "Save assessor settings", id="assessor-save", variant="primary"
+                )
+                yield Button("Cancel", id="assessor-cancel")
+
+    def on_button_pressed(self, event):
+        event.stop()
+        if event.button.id == "assessor-cancel":
+            self.dismiss(None)
+        elif event.button.id == "assessor-save":
+            try:
+                self.dismiss(
+                    {
+                        "enabled": self.query_one("#assessor-enabled", Checkbox).value,
+                        "model": self.query_one("#assessor-model", Select).value,
+                        "effort": self.query_one("#assessor-effort", Select).value,
+                        "capacity": int(
+                            self.query_one("#assessor-capacity", Input).value
+                        ),
+                        "usage_policy": {
+                            "mode": self.query_one("#assessor-policy", Select).value,
+                            "cutoff_used_percent": float(
+                                self.query_one("#assessor-cutoff", Input).value
+                            ),
+                            "taper_start_used_percent": float(
+                                self.query_one("#assessor-taper", Input).value
+                            ),
+                        },
+                    }
+                )
+            except ValueError as exc:
+                self.query_one("#assessor-error", Static).update(str(exc))

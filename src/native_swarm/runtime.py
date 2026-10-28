@@ -31,7 +31,7 @@ def configure(root: Path, profile: dict):
         replace_once(
             acquire,
             "try:c=call('claim',claim_args,scheduler_token=scheduler_token)",
-            "try:c=claim_request(ROOT,lambda:call('claim',claim_args,scheduler_token=scheduler_token))",
+            "try:c=claim_request(ROOT,lambda:call('claim',claim_args,scheduler_token=scheduler_token),address=claim_args.get('address'))",
         )
         replace_once(
             acquire,

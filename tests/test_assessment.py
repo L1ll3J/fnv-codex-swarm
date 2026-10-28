@@ -205,4 +205,4 @@ def test_abandoned_assessor_retains_slot_and_prevents_second_assessor(
     state = tmp_path / "state"
     atomic(state / "assessments/first/launch.json", {"intent": True})
     assert assessor_running(state)
-    assert occupied({}, state) == 1
+    assert occupied({}, state) == 0  # Assessor capacity is independent of reconstruction slots.

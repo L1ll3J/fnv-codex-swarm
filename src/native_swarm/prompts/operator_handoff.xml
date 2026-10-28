@@ -1,0 +1,3 @@
+<operator_handoff>
+The operator has ended reconstruction work on this assignment. Do not start further compiler or checker runs. Preserve the best actually checked source and write a concise handoff in your assigned workspace: identify its source hash and checker receipt, improvements over the starting candidate, remaining mismatches, and useful next steps. Distinguish checked evidence from hypotheses. Then end the turn.
+</operator_handoff>

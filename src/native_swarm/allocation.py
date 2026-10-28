@@ -5,7 +5,7 @@ from pathlib import Path
 from .profiles import default_profile
 from .state import atomic, read
 
-IDENTITY = ("model", "effort", "group_size")
+IDENTITY = ("model", "effort", "group_size", "team_mode")
 
 
 def selected_profile(root, cfg):
@@ -16,7 +16,11 @@ def selected_profile(root, cfg):
             return running  # Compatibility with standalone policy snapshots.
         configured = [default_profile(cfg["workers"], cfg.get("bands"))]
     wanted = next((p for p in configured if p["id"] == running.get("id")), None)
-    if wanted is None or any(wanted.get(k) != running.get(k) for k in IDENTITY):
+    if wanted is None or any(
+        wanted.get(k, "collaborative" if k == "team_mode" else None)
+        != running.get(k, "collaborative" if k == "team_mode" else None)
+        for k in IDENTITY
+    ):
         return None
     return wanted
 
@@ -71,7 +75,7 @@ def sync(root, cfg):
 WITHDRAWN = "PROFILE_ALLOCATION_WITHDRAWN_BEFORE_CLAIM"
 
 
-def claim_request(root, dispatch):
+def claim_request(root, dispatch, address=None):
     """Order claim dispatch against allocation publication; no network on refusal."""
     from .group_check import locked
 
@@ -90,12 +94,26 @@ def claim_request(root, dispatch):
             )
         ]
         ceiling = read(root / "run-config.json").get("authorized_worker_ceiling", 75)
+        from .policy import decision
+
+        try:
+            admission_target = decision(root)["target"]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError(WITHDRAWN + ": usage policy unavailable") from exc
         if (
             not wanted
-            or wanted["instances"] <= len(local)
+            or min(wanted["instances"], admission_target) <= len(local)
             or len(local) >= ceiling
             or (root / "operator-admissions-paused.json").exists()
             or (root / "operator-drain.json").exists()
         ):
+            raise RuntimeError(WITHDRAWN)
+        from .routing import allowed
+
+        rules = read(state / "routes.json")
+        if (
+            address is None
+            and any(r.get("mode") == "exclusive" for r in rules.values())
+        ) or (address is not None and not allowed(state, address, wanted["id"])):
             raise RuntimeError(WITHDRAWN)
         return dispatch()

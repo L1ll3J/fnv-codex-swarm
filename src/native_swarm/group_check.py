@@ -39,7 +39,7 @@ def check(member_path, batch_id, sources, invoke=None):
     assignment["assignment_path"] = str(canonical)
     claim = Path(assignment["claim_dir"])
     directory = claim / "collaboration"
-    board = Board(group["board"])
+    board = None if group.get("isolated") else Board(group["board"])
     driver = Path(assignment["checker_workflow"]["driver_path"])
     if digest(driver) != assignment["checker_workflow"]["driver_sha256"]:
         raise ValueError("Original recorded batch driver changed.")
@@ -56,7 +56,11 @@ def check(member_path, batch_id, sources, invoke=None):
         if (directory / "sealed.json").exists():
             from .shared_status import status
 
-            return {"checking_closed": True, "status": status(claim), "batch": None}
+            current = status(claim)
+            if group.get("isolated"):
+                current.pop("best", None)
+                current.pop("handoff", None)
+            return {"checking_closed": True, "status": current, "batch": None}
         hashes = [digest(p) for p in sources]
         if len(set(hashes)) != len(hashes):
             raise ValueError("Duplicate source within round.")
@@ -90,15 +94,16 @@ def check(member_path, batch_id, sources, invoke=None):
                     "Member round allowance exhausted; preserve handoff and discuss remaining team work."
                 )
         for path, source_hash in pending:
-            if not board.reserve(group["member"], source_hash):
+            if board and not board.reserve(group["member"], source_hash):
                 raise ValueError(
                     "Another member reserved this source; inspect the shared board."
                 )
-            board.post(
-                group["member"],
-                "reservation",
-                {"source_sha256": source_hash, "path": str(path)},
-            )
+            if board:
+                board.post(
+                    group["member"],
+                    "reservation",
+                    {"source_sha256": source_hash, "path": str(path)},
+                )
         result = {"reused_receipts": duplicates}
         if pending:
             result["batch"] = module(driver).run_batch(
@@ -134,10 +139,20 @@ def check(member_path, batch_id, sources, invoke=None):
                     for row in batch["results"]
                 ],
             }
-        board.post(group["member"], "result", compact)
+        if board:
+            board.post(group["member"], "result", compact)
+        else:
+            import uuid
+
+            atomic(
+                directory / "private-receipts" / (uuid.uuid4().hex + ".json"), compact
+            )
         from .shared_status import status
 
         result["status"] = status(claim)
+        if group.get("isolated"):
+            result["status"].pop("best", None)
+            result["status"].pop("handoff", None)
         return result
 
 
@@ -163,11 +178,12 @@ def main():
             Path(member["work_dir"]) / "nomination.json",
             {"manifest": str(path), "residual": args.residual},
         )
-        Board(group["board"]).post(
-            group["member"],
-            "handoff",
-            {"manifest": str(path), "residual": args.residual},
-        )
+        if not group.get("isolated"):
+            Board(group["board"]).post(
+                group["member"],
+                "handoff",
+                {"manifest": str(path), "residual": args.residual},
+            )
         return
     print(json.dumps(check(args.assignment, args.batch_id, args.candidates), indent=2))
 

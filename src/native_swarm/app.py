@@ -28,7 +28,14 @@ from textual.widgets import (
 from .backend import Backend, BANDS, ControlError
 from .state import Projection, read
 from .operator_store import OperatorStore
-from .dialogs import ProfileEditor, EvidenceViewer, FlagEditor
+from .dialogs import (
+    ProfileEditor,
+    EvidenceViewer,
+    FlagEditor,
+    CommandEditor,
+    TargetEditor,
+    AssessorEditor,
+)
 from .flags import submit as submit_flag
 from .board import Board
 from .policy import DEFAULT as DEFAULT_POLICY, MODES
@@ -55,7 +62,11 @@ def duration(seconds):
 class SwarmApp(App):
     TITLE = "Native Swarm"
     SUB_TITLE = "Operator control · independent checker · persistent sessions"
-    BINDINGS = [("ctrl+q", "quit", "Detach"), ("r", "refresh", "Refresh")]
+    BINDINGS = [
+        ("ctrl+q", "quit", "Detach"),
+        ("r", "refresh", "Refresh"),
+        ("space", "mark_worker", "Mark worker"),
+    ]
     CSS = """
     Screen { background: $surface; }
     #summary { height: 3; padding: 0 1; background: $boost; }
@@ -98,6 +109,7 @@ class SwarmApp(App):
         self.busy = False
         self.selected_report = None
         self.worker_columns = None
+        self.marked_workers = set()
         self.selected_worker = None
         self.selected_history = None
         self.selected_profile = None
@@ -126,6 +138,12 @@ class SwarmApp(App):
                     yield Checkbox("Checks since best", value=True, id="since-best")
                 yield DataTable(id="workers", cursor_type="row", zebra_stripes=True)
                 with Horizontal(classes="toolbar"):
+                    yield Button(
+                        "Worker / profile controls",
+                        id="worker-controls",
+                        variant="warning",
+                    )
+                    yield Button("Mark selected", id="mark-worker")
                     yield Button("Rendered prompt", id="rendered-prompt")
                     yield Button("Collaboration board", id="board")
                 yield TextArea(read_only=True, id="details")
@@ -146,16 +164,16 @@ class SwarmApp(App):
                     markup=False,
                 )
                 with Horizontal(classes="toolbar"):
-                    yield Button("Enable Sol assessor", id="assess")
+                    yield Button("Assessor settings", id="assess")
                     yield Checkbox("Show assessment history", id="assessment-history")
                 yield Static(
-                    "Assessor disabled until enabled; uses one available worker slot.",
+                    "Fresh assessor per report; independent assessment capacity.",
                     id="assessor-status",
                     markup=False,
                 )
                 yield DataTable(id="reports", cursor_type="row", zebra_stripes=True)
                 with Horizontal(classes="toolbar"):
-                    yield Button("Save assessment", id="review")
+                    yield Button("Save operator review", id="review")
                     yield Select(
                         [
                             ("Observation / quirk", "observation"),
@@ -186,7 +204,11 @@ class SwarmApp(App):
                     markup=False,
                 )
                 yield DataTable(id="queue", cursor_type="row", zebra_stripes=True)
-                yield Button("Remove selected", id="queue-remove")
+                with Horizontal(classes="toolbar"):
+                    yield Button(
+                        "Run / route function", id="target-add", variant="primary"
+                    )
+                    yield Button("Remove selected", id="queue-remove")
             with TabPane("Prompts", id="prompts-tab"):
                 with Horizontal(classes="toolbar"):
                     yield Select(
@@ -269,7 +291,7 @@ class SwarmApp(App):
                     yield Static("", id="app-update-status", markup=False)
             with TabPane("Help", id="help-tab"):
                 yield Static(
-                    "Native Swarm\n\nStart / Resume explicitly enables new work. Fresh agents receive checked history without the previous conversation.\n\nPause admissions prevents new claims, worker replacements and capacity retries. Existing workers continue. Resume is available for controllers created by this app.\n\nDrain safely closes admission permanently for that run. Workers finish under their budgets and lease deadlines, then the controller resolves their claims.\n\nCtrl+Q detaches the UI. It does not kill workers or release claims.\n\nImported runs remain under their original controllers. Wait for them to drain before starting a managed run. Process saved results reconciles ended workers through the existing audited resolver.\n\nA claim is not a worker. An open claim with no live process is shown explicitly. MATCH, submitted/pending and server-verified are separate states.\n\nBest history uses recorded checker evidence. Costs shown are API-equivalent worker lower bounds, not subscription consumption.\n\nBlocker reports preserve evidence. Existing deterministic defect validation remains in place. Marking a report reviewed sends nothing to FNV.\n\nCollaboration profiles use 2–4 generalists per function, one controller-owned lease, a shared board and one shared checker budget. Rendered prompts and board entries are available from Workers.",
+                    "Native Swarm\n\nStart / Resume explicitly enables new work. Fresh agents receive checked history without the previous conversation.\n\nPause admissions prevents new claims, worker replacements and capacity retries. Existing workers continue. Resume is available for controllers created by this app.\n\nDrain safely lets existing work finish. Start / Resume can admit replacements under your saved allocation while the old generation drains. Workers finish under their budgets and lease deadlines, then the controller resolves their claims.\n\nCtrl+Q detaches the UI. It does not kill workers or release claims.\n\nImported runs remain under their original controllers. Wait for them to drain before starting a managed run. Process saved results reconciles ended workers through the existing audited resolver.\n\nA claim is not a worker. An open claim with no live process is shown explicitly. MATCH, submitted/pending and server-verified are separate states.\n\nBest history uses recorded checker evidence. Costs shown are API-equivalent worker lower bounds, not subscription consumption.\n\nBlocker reports preserve evidence. Existing deterministic defect validation remains in place. Marking a report reviewed sends nothing to FNV.\n\nMulti-agent profiles use a configurable number of agents per function under one lease, with shared or per-member budgets. Choose collaborative or isolated execution. Use Worker / profile controls for individual, marked, profile or global commands; immediate Stop preserves evidence and releases the claim. Rendered prompts and board entries are available from Workers.",
                     id="help",
                     markup=False,
                 )
@@ -280,7 +302,12 @@ class SwarmApp(App):
             "Function", "At UTC", "Check", "Previous", "New best"
         )
         self.query_one("#reports", DataTable).add_columns(
-            "Function", "Category", "Assessment", "Validator", "FNV flag"
+            "Function",
+            "Category",
+            "Assessor verdict",
+            "Operator review",
+            "Validator",
+            "FNV flag",
         )
         self.query_one("#profiles", DataTable).add_columns(
             "Name",
@@ -304,6 +331,15 @@ class SwarmApp(App):
 
             start(self.backend.state)
             self.set_interval(3600, lambda: start(self.backend.state))
+        if self.backend.config.get("assessor", {}).get("enabled"):
+            from .assessment import start as start_assessor
+
+            try:
+                await asyncio.to_thread(start_assessor, self.backend.state)
+            except Exception as exc:
+                self.query_one("#message", Static).update(
+                    "Assessor service: " + str(exc)
+                )
         self.set_interval(2, self.refresh_data)
         await self.refresh_data()
 
@@ -404,6 +440,7 @@ class SwarmApp(App):
             else None
         )
         columns = [
+            "Marked",
             "Function",
             "State",
             "Model",
@@ -431,6 +468,7 @@ class SwarmApp(App):
         worker_rows = []
         for r in shown:
             values = [
+                "✓" if r["id"] in self.marked_workers else "",
                 r["address"],
                 r["state"],
                 r["model"],
@@ -445,7 +483,12 @@ class SwarmApp(App):
                 values.append(display(r["checks_since_best"]))
             if "Time since best" in columns:
                 values.append(duration(r["seconds_since_best"]))
-            values.append(r["error"] or ("admissions paused" if r["stop"] else ""))
+            values.append(
+                r.get("command", {}).get("reason")
+                or r.get("command", {}).get("refill_status")
+                or r["error"]
+                or ("admissions paused" if r["stop"] else "")
+            )
             worker_rows.append((r["id"], values))
         sync_rows(table, worker_rows)
         if selected in table.rows:
@@ -471,7 +514,9 @@ class SwarmApp(App):
         reviews = read(self.backend.state / "reviews.json")
         assessment_state = read(self.backend.state / "assessment-service.json")
         self.query_one("#assessor-status", Static).update(
-            "Sol medium assessor: " + assessment_state.get("status", "disabled")
+            "Assessor: "
+            + assessment_state.get("status", "disabled")
+            + f" · active {assessment_state.get('active', 0)}/{self.backend.config.get('assessor', {}).get('capacity', 1)} · output: Assessor verdict column and report details"
         )
         flag_states = {
             r.get("report_id"): r.get("state", "")
@@ -486,11 +531,13 @@ class SwarmApp(App):
                     [
                         r["address"],
                         str(r["proposal"].get("category", "unspecified")),
-                        ("Operator: " + reviews[r["id"]]["status"])
-                        if r["id"] in reviews
-                        else ("Sol: " + r["assessment"]["decision"])
-                        if r.get("assessment", {}).get("decision")
-                        else "unassessed",
+                        r.get("assessment", {}).get("decision", "unassessed"),
+                        {
+                            "suspected": "Needs evidence / do not flag yet",
+                            "established": "Operator considers established",
+                            "observation": "Observation / do not flag",
+                            "resolved": "Resolved",
+                        }.get(reviews.get(r["id"], {}).get("status"), "Not reviewed"),
                         str(r["validation"].get("status", "unvalidated")),
                         flag_states.get(r["id"], ""),
                     ],
@@ -592,10 +639,7 @@ class SwarmApp(App):
     async def on_button_pressed(self, event: Button.Pressed):
         if self.busy:
             return
-        from .assessment import start as start_assessor
-
         actions = {
-            "assess": lambda: start_assessor(self.backend.state),
             "start": self.backend.start,
             "pause": self.backend.pause,
             "drain": self.backend.drain,
@@ -604,6 +648,40 @@ class SwarmApp(App):
         self.busy = True
         try:
             action = event.button.id
+            if action == "mark-worker":
+                self.action_mark_worker()
+                return
+            if action == "worker-controls":
+                self.push_screen(
+                    CommandEditor(self.profile_drafts),
+                    lambda result: (
+                        self.run_worker(self.apply_command(result)) if result else None
+                    ),
+                )
+                return
+            if action == "target-add":
+                self.push_screen(
+                    TargetEditor(self.profile_drafts),
+                    lambda result: (
+                        self.run_worker(self.add_target(result)) if result else None
+                    ),
+                )
+                return
+            if action == "assess":
+                self.push_screen(
+                    AssessorEditor(
+                        {
+                            "usage_policy": self.backend.config.get(
+                                "usage_policy", DEFAULT_POLICY
+                            ),
+                            **self.backend.config.get("assessor", {}),
+                        }
+                    ),
+                    lambda result: (
+                        self.run_worker(self.save_assessor(result)) if result else None
+                    ),
+                )
+                return
             if action in ("profile-add", "profile-edit"):
                 profile = next(
                     (
@@ -786,6 +864,126 @@ class SwarmApp(App):
         except (ValueError, ControlError, OSError) as exc:
             message = str(exc)
         self.query_one("#message", Static).update(message)
+
+    def action_mark_worker(self):
+        if self.selected_worker:
+            if self.selected_worker in self.marked_workers:
+                self.marked_workers.remove(self.selected_worker)
+            else:
+                self.marked_workers.add(self.selected_worker)
+            self.render_data()
+
+    async def apply_command(self, value):
+        try:
+            scope, action = value.pop("scope"), value.pop("action")
+            rows = [r for r in self.data["rows"] if action == "acknowledge" or not r["closed"]]
+            if scope == "selected":
+                rows = [r for r in rows if r["id"] == self.selected_worker]
+            elif scope == "marked":
+                rows = [r for r in rows if r["id"] in self.marked_workers]
+            elif scope != "all":
+                rows = [
+                    r
+                    for r in rows
+                    if read(
+                        Path(r["id"]).parent.parent / "native-app-profile.json"
+                    ).get("id")
+                    == scope
+                ]
+            if action in ("pause_profile", "resume_profile"):
+                profiles = (
+                    [p["id"] for p in self.profile_drafts]
+                    if scope == "all"
+                    else [scope]
+                    if scope not in ("selected", "marked")
+                    else list(
+                        {
+                            read(
+                                Path(r["id"]).parent.parent / "native-app-profile.json"
+                            ).get("id")
+                            for r in rows
+                        }
+                    )
+                )
+                if not profiles:
+                    raise ValueError("Select a worker or profile.")
+                messages = [
+                    await asyncio.to_thread(
+                        self.backend.profile_pause, p, action == "pause_profile"
+                    )
+                    for p in profiles
+                ]
+                message = " · ".join(messages)
+            elif action == "acknowledge":
+                if scope in ("selected", "marked"):
+                    runs = {str(Path(r["id"]).parent.parent) for r in rows}
+                else:
+                    runs = {
+                        value for value in self.backend.config.get("managed_runs", [])
+                        if scope == "all"
+                        or read(Path(value) / "native-app-profile.json").get("id") == scope
+                    }
+                if not runs:
+                    raise ValueError(
+                        "Select a managed worker, profile or controller scope to acknowledge."
+                    )
+                message = " · ".join(
+                    [
+                        await asyncio.to_thread(self.backend.acknowledge_hold, r)
+                        for r in runs
+                    ]
+                )
+            elif action == "retry":
+                from .commands import retry
+
+                message = (
+                    " · ".join(
+                        [
+                            await asyncio.to_thread(retry, self.backend.state, r["id"])
+                            for r in rows
+                        ]
+                    )
+                    or "Select an open claim."
+                )
+            else:
+                if scope == "all":
+                    await asyncio.to_thread(self.backend.drain)
+                    if not value["replace"]:
+                        await asyncio.to_thread(self.backend.pause)
+                message = (
+                    await asyncio.to_thread(
+                        self.backend.worker_command,
+                        [r["id"] for r in rows],
+                        action,
+                        **value,
+                    )
+                    if rows
+                    else "No open workers selected. Existing preparations are draining."
+                )
+            self.query_one("#message", Static).update(message)
+        except Exception as exc:
+            self.query_one("#message", Static).update(str(exc))
+        await self.refresh_data()
+
+    async def add_target(self, value):
+        try:
+            from .routing import enqueue_target
+
+            await asyncio.to_thread(enqueue_target, self.backend.state, **value)
+            self.query_one("#message", Static).update(
+                "Target queued with the selected route. Start / Resume enables admissions."
+            )
+        except Exception as exc:
+            self.query_one("#message", Static).update(str(exc))
+        await self.refresh_data()
+
+    async def save_assessor(self, value):
+        try:
+            message = await asyncio.to_thread(self.backend.assessor_settings, value)
+            self.query_one("#message", Static).update(message)
+        except Exception as exc:
+            self.query_one("#message", Static).update(str(exc))
+        await self.refresh_data()
 
     async def send_flag(self, report, payload):
         try:

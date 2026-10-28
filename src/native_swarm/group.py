@@ -62,6 +62,10 @@ def score(path):
 
 def group_terminal(claim):
     claim = Path(claim)
+    from .commands import operator_terminal
+
+    if operator_terminal(claim):
+        return True
     directory = claim / "collaboration"
     if not directory.exists():
         return True
@@ -219,6 +223,7 @@ def run(root, claim_id):
     assignment_path = claim / "assignment.json"
     assignment = read(assignment_path)
     profile = read(root / "native-app-profile.json")
+    isolated = profile.get("team_mode", "collaborative") == "isolated"
     directory = claim / "collaboration"
     directory.mkdir(exist_ok=True)
     # No supervisor relaunch on an ambiguous process-start window.
@@ -235,6 +240,7 @@ def run(root, claim_id):
         "model": assignment["model"],
         "effort": assignment["reasoning_effort"],
         "members": [],
+        "isolated": isolated,
         "state": "running",
     }
     atomic(directory / "group.json", manifest)
@@ -310,9 +316,12 @@ def run(root, claim_id):
         atomic(directory / "group.json", manifest)
         err = (workspace / "stderr.log").open("ab")
         files.append(err)
+        argv = peer_command(root, assignment, thread)
+        if isolated:
+            argv[argv.index("-C") + 1] = str(workspace)
         proc = subprocess.Popen(
-            peer_command(root, assignment, thread),
-            cwd=root,
+            argv,
+            cwd=workspace if isolated else root,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=err,
@@ -353,6 +362,11 @@ def run(root, claim_id):
                 "board_command": f"{sys.executable} -m native_swarm.board --assignment {member_path}",
                 "shared_checker": f"{sys.executable} -m native_swarm.group_check --assignment {member_path}",
             }
+            if isolated:
+                data["collaboration"]["isolated"] = True
+                data["collaboration"].pop("shared_paths", None)
+                data["collaboration"].pop("board", None)
+                data["collaboration"].pop("board_command", None)
             data["checker_workflow"] = dict(assignment["checker_workflow"])
             command = data["collaboration"]["shared_checker"]
             from . import group_check
@@ -367,10 +381,18 @@ def run(root, claim_id):
                 + ' --finish CHECK_MANIFEST_JSON --residual "concise residual issue"',
             )
             atomic(member_path, data)
+            visible = dict(data)
+            if isolated:
+                visible.pop("collaboration", None)
+                visible["member_budget"] = {
+                    "member": member_id,
+                    "budget_mode": assignment.get("budget_mode", "shared"),
+                    "members": profile["group_size"],
+                }
             prompt = (
                 (root / "worker-contract.xml").read_bytes()
                 + b"\nASSIGNMENT JSON\n"
-                + member_path.read_bytes()
+                + json.dumps(visible).encode()
             )
             prompt_path = workspace / "cli-prompt.txt"
             prompt_path.write_bytes(prompt)
@@ -606,18 +628,24 @@ def run(root, claim_id):
     return result.returncode
 
 
-def audit_group(claim):
+def audit_group(claim, *, allow_operator_stop=False):
     """Additional provenance gate; the original evidence audit still follows."""
     claim = Path(claim)
     directory = claim / "collaboration"
     if not directory.exists():
         return True
     state = read(directory / "group.json")
+    from .commands import operator_terminal
+
+    stopped = allow_operator_stop and operator_terminal(claim)
     if (
         state.get("state") != "sealed"
+        and not stopped
         or group_rejected(claim)
         or state.get("ordinary_failure")
+        and not stopped
         or not state.get("streams_closed")
+        and not stopped
     ):
         raise ValueError("Group is not safely sealed.")
     if digest(claim / "assignment.json") != state["canonical_assignment_sha256"]:
@@ -645,6 +673,17 @@ def audit_group(claim):
         str(path.resolve())
         for path in (claim / "work/recorded-checks").glob("check-*.json")
     }
+    if state.get("isolated"):
+        for path in (directory / "private-receipts").glob("*.json"):
+            value = read(path)
+            attributed.update(
+                resolve_receipt(p) for p in value.get("reused_receipts", {}).values()
+            )
+            attributed.update(
+                resolve_receipt(row["manifest"])
+                for row in value.get("batch", {}).get("results", [])
+                if not row.get("reused")
+            )
     if actual != attributed:
         raise ValueError("Group check receipts are missing shared-board provenance.")
     usage = {
@@ -656,7 +695,9 @@ def audit_group(claim):
         if (
             not workspace.resolve().is_relative_to(directory.resolve())
             or member.get("exit_code") is None
+            and not stopped
             or ordinary_peer_failure(member)
+            and not stopped
             or process_alive(member.get("pid"), claim.parent.parent)
         ):
             raise ValueError(
@@ -667,7 +708,10 @@ def audit_group(claim):
             or digest(workspace / "assignment.json") != member["assignment_sha256"]
         ):
             raise ValueError("Group prompt or assignment changed.")
-        observed = usage.get(member.get("thread_id"))
+        thread_id = member.get("thread_id")
+        if stopped and not thread_id:
+            thread_id = read(workspace / "thread.json").get("thread_id")
+        observed = usage.get(thread_id)
         if not observed or observed.get("usage") is None:
             return False
         if observed.get("model") != state["model"]:

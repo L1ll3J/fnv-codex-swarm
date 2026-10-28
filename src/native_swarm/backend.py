@@ -205,7 +205,9 @@ class Backend:
 
     def pause(self):
         with self.locked():
-            atomic(self.state / "assessment-admissions-paused.json", {"at": self.now()})
+            cfg = self.config
+            cfg["paused_profiles"] = [p["id"] for p in self.profiles()]
+            atomic(self.state / "config.json", cfg)
             for run in self.runs():
                 if (run / "native-app-managed.json").exists():
                     atomic(
@@ -224,7 +226,6 @@ class Backend:
 
     def drain(self):
         with self.locked():
-            atomic(self.state / "assessment-admissions-paused.json", {"at": self.now()})
             for run in self.runs():
                 if (run / "native-app-managed.json").exists():
                     atomic(run / "operator-drain.json", {"requested_at": self.now()})
@@ -237,6 +238,100 @@ class Backend:
                     except FileExistsError:
                         pass
         return "Draining: no new work; existing workers finish normally."
+
+    def worker_command(
+        self,
+        claims,
+        action,
+        *,
+        replace=False,
+        handoff="improved",
+        timeout=45,
+        resume_admissions=True,
+    ):
+        from .commands import issue
+
+        records = issue(
+            self.state,
+            claims,
+            action,
+            replace=replace,
+            handoff=handoff,
+            timeout=timeout,
+            resume_admissions=resume_admissions,
+        )
+        return f"Requested {action} for {len(records)} assignment(s). Status is shown on each worker."
+
+    def profile_pause(self, identifier, paused):
+        with self.locked():
+            cfg = self.config
+            profiles = {p["id"] for p in self.profiles()}
+            if identifier not in profiles:
+                raise ControlError("Select an existing profile.")
+            values = set(cfg.get("paused_profiles", []))
+            values.add(identifier) if paused else values.discard(identifier)
+            cfg["paused_profiles"] = sorted(values)
+            atomic(self.state / "config.json", cfg)
+            for run in self.runs():
+                if read(run / "native-app-profile.json").get("id") == identifier:
+                    if paused:
+                        atomic(
+                            run / "operator-admissions-paused.json",
+                            {"source": "operator-profile", "at": self.now()},
+                        )
+                    elif (
+                        read(run / "operator-admissions-paused.json").get("source")
+                        == "operator-profile"
+                    ):
+                        (run / "operator-admissions-paused.json").unlink()
+        return "Profile admissions paused." if paused else self.start([identifier])
+
+    def acknowledge_hold(self, run):
+        from .commands import retire
+
+        run = Path(run)
+        with self.locked():
+            if run not in self.runs():
+                raise ControlError("Select a managed controller.")
+            if (run / "approval-blocker-current.json").exists():
+                raise ControlError(
+                    "A permission rejection needs review and specific approval; this hold action does not clear it."
+                )
+            retire(run, acknowledge=True)
+        return "Controller hold acknowledged for replacement. Start still checks account health and actual capacity."
+
+    def assessor_settings(self, value):
+        from .profiles import MODELS
+        from .assessment import start
+
+        if (
+            value.get("model") not in MODELS
+            or value.get("effort") not in MODELS[value["model"]]["efforts"]
+        ):
+            raise ControlError("Choose a supported assessor model and reasoning level.")
+        if (
+            type(value.get("enabled")) is not bool
+            or type(value.get("capacity")) is not int
+            or value["capacity"] < 1
+        ):
+            raise ControlError(
+                "Choose a positive assessment capacity and enabled state."
+            )
+        value = {**value, "usage_policy": validate_policy(value.get("usage_policy"))}
+        with self.locked():
+            cfg = self.config
+            cfg["assessor"] = value
+            atomic(self.state / "config.json", cfg)
+            if not value["enabled"]:
+                atomic(
+                    self.state / "assessment-admissions-paused.json",
+                    {"source": "operator"},
+                )
+        return (
+            start(self.state)
+            if value["enabled"]
+            else "Assessor admissions disabled; active assessments finish."
+        )
 
     def review(self, proposal_id: str, status: str, *, note=None, evidence_refs=None):
         if status not in (
@@ -318,16 +413,54 @@ class Backend:
     def now():
         return dt.datetime.now(dt.timezone.utc).isoformat()
 
-    def start(self):
+    def start(self, profile_ids=None, *, restore_slots=True):
         with self.locked():
             cfg = self.config
             if not cfg:
                 raise ControlError("App setup is missing.")
-            active = []
+            for value in cfg.get("managed_runs", []):
+                if (Path(value) / "approval-blocker-current.json").exists():
+                    raise ControlError(
+                        f"Permission stop retained for {Path(value).name}; review approval-blocker-current.json before resuming."
+                    )
+            from .commands import operator_retiring, retire
+            from .command_worker import recover_completion
+
+            for run in self.runs():
+                if (run / "operator-completion-window.json").exists():
+                    recover_completion(run)
+
+            def restore_admissions():
+                if not restore_slots:
+                    return
+                cfg["paused_profiles"] = [
+                    p
+                    for p in cfg.get("paused_profiles", [])
+                    if profile_ids is not None and p not in profile_ids
+                ]
+                atomic(self.state / "config.json", cfg)
+                idle = read(self.state / "idle-slots.json")
+                for profile in self.profiles():
+                    if profile_ids is None or profile["id"] in profile_ids:
+                        idle.pop(profile["id"], None)
+                atomic(self.state / "idle-slots.json", idle)
+                reservations = read(self.state / "idle-reservations.json")
+                reservations = {
+                    claim: profile
+                    for claim, profile in reservations.items()
+                    if profile_ids is not None and profile not in profile_ids
+                }
+                atomic(self.state / "idle-reservations.json", reservations)
+
+            active, retiring = [], []
             for path in cfg.get("managed_runs", []):
                 run = Path(path)
                 owner = read(run / ".rolling-executor-owner.json")
                 if process_alive(owner.get("pid"), run):
+                    if operator_retiring(run):
+                        retire(run)
+                        retiring.append(run)
+                        continue
                     if (run / "STOP_NEW_CLAIMS").exists() or (
                         run / "operator-drain.json"
                     ).exists():
@@ -343,15 +476,21 @@ class Backend:
                             "Its stop is preserved; resolve it before resuming."
                         )
                     active.append(run)
-            if active:
+            if active or retiring:
+                reference = (active or retiring)[0]
                 self.quota(
-                    cfg, read(active[0] / "native-app-codex.json").get("executable")
+                    cfg, read(reference / "native-app-codex.json").get("executable")
                 )
                 from .allocation import sync, selected_profile
 
                 profiles = self.profiles()
                 validate_profiles(profiles, cfg.get("worker_capacity", 10))
-                profiles = [p for p in profiles if p["instances"] > 0]
+                profiles = [
+                    p
+                    for p in profiles
+                    if p["instances"] > 0
+                    and (profile_ids is None or p["id"] in profile_ids)
+                ]
                 by_id = {p["id"]: p for p in profiles}
                 represented = set()
                 retired = []
@@ -391,7 +530,7 @@ class Backend:
                     # Never replace a controller that lost ownership while its
                     # model processes (including collaboration peers) remain live.
                     for run in self.runs():
-                        if run in active:
+                        if run in active or run in retiring:
                             continue
                         journal = read(run / "rolling-executor/journal.json")
                         if not self.groups_terminal(run) or any(
@@ -405,8 +544,9 @@ class Backend:
                     template = Path(cfg["template_run"])
                     self.verify_template(template, cfg)
                 account = self.preflight(
-                    active[0] if active else template, require_idle=False
+                    (active or retiring or retired)[0], require_idle=False
                 )
+                restore_admissions()
                 created = []
                 try:
                     for profile in missing:
@@ -425,13 +565,14 @@ class Backend:
                 for run in active:
                     sync(run, cfg)
                     wanted = selected_profile(run, cfg)
-                    if not wanted or wanted["instances"] == 0:
+                    if (
+                        not wanted
+                        or wanted["instances"] == 0
+                        or (profile_ids is not None and wanted["id"] not in profile_ids)
+                    ):
                         continue
                     (run / "operator-admissions-paused.json").unlink(missing_ok=True)
                     (run / "operator-usage-paused.json").unlink(missing_ok=True)
-                (self.state / "assessment-admissions-paused.json").unlink(
-                    missing_ok=True
-                )
                 if pending:
                     return (
                         f"Admissions resumed; {len(pending)} profile handover(s) will finish "
@@ -460,7 +601,12 @@ class Backend:
                     )
             profiles = self.profiles()
             validate_profiles(profiles, cfg.get("worker_capacity", 10))
-            profiles = [p for p in profiles if p["instances"] > 0]
+            profiles = [
+                p
+                for p in profiles
+                if p["instances"] > 0
+                and (profile_ids is None or p["id"] in profile_ids)
+            ]
             if not profiles:
                 raise ControlError(
                     "No slots allocated. Edit a worker profile and assign at least one concurrent function before Start."
@@ -469,6 +615,7 @@ class Backend:
             template = Path(cfg["template_run"])
             self.verify_template(template, cfg)
             account = self.preflight(template, require_idle=True)
+            restore_admissions()
             created = []
             try:
                 for profile in profiles:
@@ -484,7 +631,6 @@ class Backend:
                         },
                     )
                 raise
-            (self.state / "assessment-admissions-paused.json").unlink(missing_ok=True)
             return "Native swarm started. Closing this app detaches; all profile controllers keep running."
 
     def quota(self, cfg, executable=None):
@@ -612,6 +758,7 @@ class Backend:
                 "usage_policy_version": 1,
                 "supervision_version": 2,
                 "allocation_version": 1,
+                "command_center_version": 1,
                 "withdrawn_preparation_closure_version": 1,
                 "toolchain_version": 1,
             },
@@ -624,12 +771,19 @@ class Backend:
         prompt_default = (
             Path(__file__).parent
             / "prompts"
-            / ("generalists.xml" if profile["group_size"] > 1 else "independent.xml")
+            / (
+                "generalists.xml"
+                if profile["group_size"] > 1
+                and profile.get("team_mode", "collaborative") == "collaborative"
+                else "independent.xml"
+            )
         )
         # Packaged defaults include only individually approved prompt changes.
         (root / "worker-contract.xml").write_text(
             OperatorStore(self.state).prompt(
-                prompt_default, group=profile["group_size"] > 1
+                prompt_default,
+                group=profile["group_size"] > 1
+                and profile.get("team_mode", "collaborative") == "collaborative",
             )
         )
         stop = "Explicit operator Start from native app; ownership handover before admissions.\n"
