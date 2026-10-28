@@ -67,6 +67,10 @@ def configure(root: Path, profile: dict):
             "                assert record.exists(),'Checker did not produce a receipt; stop and preserve evidence'",
             "                if not record.exists():\n                    from native_swarm.duplicates import duplicate_result\n                    reused=duplicate_result(assignment,result.stdout,digest,result.returncode)\n                    if reused is not None:\n                        batch['results'].append(dict(reused,candidate_index=index+1));batch.pop('pending',None);save(path,batch);continue\n                assert record.exists(),'Checker did not produce a receipt; stop and preserve evidence'",
         )
+    if batch.exists():
+        from .rolling_runtime import configure_batch
+
+        configure_batch(batch)
     replace_once(
         root / "resolve_ready.py",
         " for p in sorted((ROOT/'claims').glob('*')):",

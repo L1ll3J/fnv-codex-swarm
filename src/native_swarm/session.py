@@ -40,12 +40,16 @@ def due_expired_claims(root, *args, **kwargs):
 
 
 def remaining(claim, assignment):
+    from .budgets import effective_limits
+
     value = status(claim)
+    limits = effective_limits(claim, assignment)
     return (
         value["rounds_remaining"] > 0
-        and value["checks"] < assignment.get("max_plain_checks", 160)
-        and value["compiler_invocations_upper_bound"] + assignment.get("official_internal_retry_bound", 4)
-        <= assignment.get("max_compiler_invocations", 640)
+        and value["checks"] < limits["max_plain_checks"]
+        and value["compiler_invocations_upper_bound"]
+        + assignment.get("official_internal_retry_bound", 4)
+        <= limits["max_compiler_invocations"]
     )
 
 

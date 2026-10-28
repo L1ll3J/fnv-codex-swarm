@@ -11,6 +11,7 @@ import threading
 import time
 
 from .board import Board
+from .budgets import member_round_limit
 from .group_check import digest, locked
 from .state import atomic, read, process_alive
 from .shared_status import status as shared_status
@@ -366,9 +367,11 @@ def run(root, claim_id):
                     retain_rejection(root, claim_id, member["id"], evidence)
             records = list((claim / "work/recorded-checks").glob("check-*.json"))
             matched = any(score(path)[0] == 0 for path in records)
-            exhausted = (
-                len(list((claim / "work/batch-rounds").glob("*.json")))
-                >= assignment["max_batch_rounds"]
+            exhausted = len(
+                list((claim / "work/batch-rounds").glob("*.json"))
+            ) >= shared_status(claim)["rounds_limit"] and not any(
+                read(path).get("state") == "running"
+                for path in (claim / "work/batch-rounds").glob("*.json")
             )
             if (
                 exhausted
@@ -417,9 +420,10 @@ def run(root, claim_id):
                             (claim / "work/batch-rounds").glob(member["id"] + "-*.json")
                         )
                     )
-                    own_exhausted = (
-                        assignment.get("budget_mode") == "per_member"
-                        and used >= assignment["rounds_per_member"]
+                    own_exhausted = assignment.get(
+                        "budget_mode"
+                    ) == "per_member" and used >= member_round_limit(
+                        claim, assignment, member["id"]
                     )
                     if (
                         proc.poll() == 0

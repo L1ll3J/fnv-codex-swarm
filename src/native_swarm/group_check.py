@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 
 from .board import Board
+from .budgets import member_round_limit
 from .state import atomic, read
 
 
@@ -81,7 +82,8 @@ def check(member_path, batch_id, sources, invoke=None):
                 / (group["member"] + "-" + batch_id + ".json")
             )
             if (
-                len(own_rounds) >= assignment["rounds_per_member"]
+                len(own_rounds)
+                >= member_round_limit(claim, assignment, group["member"])
                 and not existing.exists()
             ):
                 raise ValueError(
