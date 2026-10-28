@@ -299,17 +299,76 @@ class Backend:
                     if (run / "STOP_NEW_CLAIMS").exists() or (
                         run / "operator-drain.json"
                     ).exists():
+                        stop = run / "STOP_NEW_CLAIMS"
+                        reason = (
+                            stop.read_text(errors="replace").strip()[:1200]
+                            if stop.exists()
+                            else read(run / "operator-drain.json").get("reason")
+                            or "Operator requested a safe drain"
+                        )
                         raise ControlError(
-                            "A managed controller is draining or stopped for review; its stop is preserved."
+                            f"Controller {run.name} is stopped: {reason}. "
+                            "Its stop is preserved; resolve it before resuming."
                         )
                     active.append(run)
             if active:
                 self.quota(
                     cfg, read(active[0] / "native-app-codex.json").get("executable")
                 )
-                self.preflight(active[0], require_idle=False)
                 from .allocation import sync, selected_profile
 
+                profiles = self.profiles()
+                validate_profiles(profiles, cfg.get("worker_capacity", 10))
+                profiles = [p for p in profiles if p["instances"] > 0]
+                by_id = {p["id"]: p for p in profiles}
+                represented = set()
+                for run in active:
+                    running = read(run / "native-app-profile.json")
+                    wanted = selected_profile(run, cfg)
+                    if running.get("id") in by_id and wanted is None:
+                        raise ControlError(
+                            f"Profile {running['id']} has an active controller with different "
+                            "model, reasoning or team size. Its current tasks must finish "
+                            "and its controller must stop before starting the replacement."
+                        )
+                    if wanted and wanted["instances"] > 0:
+                        if wanted["id"] in represented:
+                            raise ControlError(
+                                f"Multiple active controllers own profile {wanted['id']}; "
+                                "resolve their ownership before resuming."
+                            )
+                        represented.add(wanted["id"])
+                missing = [p for p in profiles if p["id"] not in represented]
+                if missing:
+                    # Never replace a controller that lost ownership while its
+                    # model processes (including collaboration peers) remain live.
+                    for run in self.runs():
+                        if run in active:
+                            continue
+                        journal = read(run / "rolling-executor/journal.json")
+                        if not self.groups_terminal(run) or any(
+                            process_alive(job.get("pid"), run)
+                            for job in journal.get("jobs", {}).values()
+                        ):
+                            raise ControlError(
+                                "Workers without an active controller are still draining. "
+                                "Resolve their ownership before starting another profile."
+                            )
+                    template = Path(cfg["template_run"])
+                    self.verify_template(template, cfg)
+                account = self.preflight(active[0], require_idle=False)
+                created = []
+                try:
+                    for profile in missing:
+                        self.create_run(cfg, template, account, profile)
+                        created.append(self.current)
+                except Exception:
+                    for run in created:
+                        atomic(
+                            run / "operator-admissions-paused.json",
+                            {"requested_at": self.now(), "reason": "profile start incomplete"},
+                        )
+                    raise
                 for run in active:
                     sync(run, cfg)
                     wanted = selected_profile(run, cfg)
@@ -320,7 +379,12 @@ class Backend:
                 (self.state / "assessment-admissions-paused.json").unlink(
                     missing_ok=True
                 )
-                return "Admissions resumed for active profiles. Current saved allocations govern future admissions."
+                return (
+                    f"Admissions resumed; started {len(created)} new profile controller(s). "
+                    "Existing workers keep running under the saved allocations and total capacity."
+                    if created
+                    else "Admissions resumed for active profiles. Current saved allocations govern future admissions."
+                )
             # A fresh controller never tries to reattach live model processes.
             for run in self.runs():
                 owner = read(run / ".rolling-executor-owner.json")
