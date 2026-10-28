@@ -778,9 +778,8 @@ def release(claim, record, best=None):
         "claim_id": claim.name,
         "reason": "Operator ended this assignment early; checked sources, diagnostics and handoff are preserved.",
     }
-    if best:
-        payload["best_code"] = Path(best[2]["source_path"]).read_text()
-        payload["model"] = read(claim / "assignment.json")["model"]
+    # An operator stop can precede verified thread/model accounting. Preserve
+    # candidate provenance locally; do not publish configured model attribution.
     rpc = "from service import call,save; import json,sys; result=call('giveup',json.load(sys.stdin)); save('claims/'+sys.argv[1]+'/giveup-response.json',result); print(json.dumps(result))"
     result = resolution_rpc(
         claim,

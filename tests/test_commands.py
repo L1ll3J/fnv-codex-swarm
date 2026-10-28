@@ -1042,3 +1042,24 @@ def test_stop_preserves_canonical_permission_flags_before_release(tmp_path, monk
     resume.assert_not_called()
     assert (run / "approval-blocker-current.json").exists()
     assert read(claim / "operator-command.json")["state"] == "review_required"
+
+
+def test_operator_release_never_publishes_unverified_candidate_attribution(tmp_path, monkeypatch):
+    import json
+
+    _, run, claim = fixture(tmp_path)
+    receipt(claim)
+    monkeypatch.setattr(worker.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(stdout=json.dumps({"owned": True}), returncode=0))
+    payloads = []
+
+    def rpc(claim_path, argv, **kwargs):
+        payloads.append(json.loads(kwargs["input"]))
+        atomic(claim_path / "giveup-response.json", {"released": True})
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worker, "resolution_rpc", rpc)
+    worker.release(claim, {"id": "stop"}, worker.preserve(claim))
+    assert payloads[0]["claim_id"] == claim.name
+    assert "best_code" not in payloads[0]
+    assert "model" not in payloads[0]
+    assert read(claim / "operator-handoff.json")["best_receipt"]
