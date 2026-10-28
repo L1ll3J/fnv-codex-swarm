@@ -612,6 +612,7 @@ class Backend:
                 "usage_policy_version": 1,
                 "supervision_version": 2,
                 "allocation_version": 1,
+                "withdrawn_preparation_closure_version": 1,
                 "toolchain_version": 1,
             },
         )

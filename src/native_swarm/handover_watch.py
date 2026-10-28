@@ -102,6 +102,22 @@ def advance(root, backend):
                     },
                 )
                 return True
+        if read(root / "native-app-managed.json").get(
+            "withdrawn_preparation_closure_version"
+        ) != 1 and any(
+            job.get("state") in ("prepared", "prepared_waiting_transient_gate")
+            for job in read(root / "rolling-executor/journal.json")
+            .get("jobs", {})
+            .values()
+        ):
+            atomic(
+                marker,
+                {
+                    "state": "blocked",
+                    "reason": "This older controller cannot close a prepared assignment after a profile change. Use Drain safely to close its unlaunched claim, then Start / Resume after it exits; running workers keep their evidence.",
+                },
+            )
+            return True
         if idle_reason(root):
             return False
         # Quota and service readiness are checked only once the old work is done.
