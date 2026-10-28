@@ -109,6 +109,9 @@ def configure(root: Path, profile: dict):
     atomic(root / "run-config.json", config)
     watcher = root / "campaign_watch.py"
     if watcher.exists():
+        from .status_poll import configure as configure_status_poll
+
+        configure_status_poll(root)
         replace_once(
             watcher,
             "reserve_file=ROOT.parent.parent/'research/usage-reserve/status.json'",
