@@ -1,7 +1,7 @@
 """Execute one operator request with durable release reconciliation."""
 
 import hashlib
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import json
 import os
 from pathlib import Path
@@ -910,7 +910,11 @@ def execute(state, identifier):
                 update(state, record, "waiting_for_round")
                 rounds = claim / "work/batch-rounds"
                 rounds.mkdir(parents=True, exist_ok=True)
-                with locked(rounds / ".lock"):
+                group = claim / "collaboration"
+                with (
+                    locked(group / "checker.lock") if group.exists() else nullcontext(),
+                    locked(rounds / ".lock"),
+                ):
                     update(state, record, "stopping")
                     stop_tree(claim)
             else:

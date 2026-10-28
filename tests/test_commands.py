@@ -1165,3 +1165,40 @@ def test_unsettled_handoff_reserves_capacity_after_parent_exit(tmp_path):
     _, _, claim = fixture(tmp_path)
     atomic(claim / "operator-handoff-process.json", {"intent": True, "pid": 99999999, "finished": False})
     assert handoff_reserved(claim)
+
+
+def test_finish_round_waits_for_group_provenance_publication(tmp_path, monkeypatch):
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from native_swarm.group_check import locked
+
+    state, run, claim = fixture(tmp_path)
+    driver = claim / "batch.py"
+    driver.write_text("block_new_batch")
+    atomic(claim / "assignment.json", {"model": "gpt-6.1-sol", "checker_workflow": {"driver_path": str(driver)}})
+    atomic(claim / "collaboration/group.json", {"members": [], "state": "running"})
+    monkeypatch.setattr("native_swarm.commands.subprocess.Popen", Mock(return_value=SimpleNamespace(pid=99999999)))
+    record = issue(state, [claim], "finish_round")[0]
+    stopped = threading.Event()
+    provenance = claim / "collaboration/check-provenance.jsonl"
+
+    def stop(*args, **kwargs):
+        assert provenance.read_text() == "complete provenance"
+        stopped.set()
+
+    monkeypatch.setattr(worker, "stop_tree", stop)
+    monkeypatch.setattr(worker, "release", Mock())
+    monkeypatch.setattr(Backend, "start", Mock(return_value="resumed"))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with locked(claim / "collaboration/checker.lock"):
+            future = pool.submit(worker.execute, state, record["id"])
+            deadline = time.monotonic() + 3
+            while read(claim / "operator-command.json")["state"] != "waiting_for_round" and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert not stopped.is_set()
+            assert not future.done()
+            provenance.write_text("complete provenance")
+        future.result(timeout=3)
+    assert stopped.is_set()
+    assert read(claim / "operator-command.json")["state"] == "completed"
