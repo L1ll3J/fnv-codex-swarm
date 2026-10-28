@@ -433,3 +433,31 @@ def test_command_center_forms_expose_scopes_routing_and_separate_assessor(tmp_pa
             assert backend.config['assessor']['enabled'] is False
             await pilot.press('ctrl+q')
     asyncio.run(asyncio.wait_for(scenario(), timeout=25))
+
+
+def test_acknowledge_profile_and_global_scope_without_open_claim(tmp_path, monkeypatch):
+    async def scenario():
+        run = tmp_path / "run"
+        atomic(run / "native-app-profile.json", {"id": "default"})
+        state = tmp_path / "state"
+        atomic(state / "config.json", {"workers": 1, "bands": ["4K+"], "managed_runs": [str(run)], "observed_runs": [], "quota_path": str(state / "quota")})
+        backend = Backend(state)
+        acknowledge = Mock(return_value="Controller acknowledged")
+        monkeypatch.setattr(backend, "acknowledge_hold", acknowledge)
+        app = SwarmApp(backend)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause()
+            app.data["rows"] = []
+            await app.apply_command({"scope": "default", "action": "acknowledge"})
+            acknowledge.assert_called_once_with(str(run))
+            acknowledge.reset_mock()
+            await app.apply_command({"scope": "all", "action": "acknowledge"})
+            acknowledge.assert_called_once_with(str(run))
+            acknowledge.reset_mock()
+            claim = run / "claims/closed"
+            app.data["rows"] = [{"id": str(claim), "closed": True}]
+            app.selected_worker = str(claim)
+            await app.apply_command({"scope": "selected", "action": "acknowledge"})
+            acknowledge.assert_called_once_with(str(run))
+            await pilot.press("ctrl+q")
+    asyncio.run(asyncio.wait_for(scenario(), timeout=20))

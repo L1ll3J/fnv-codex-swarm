@@ -1024,3 +1024,21 @@ def test_retry_retains_unsettled_resolution_and_completion_hold(tmp_path, monkey
     assert (claim / "operator-release-intent.json").exists()
     with pytest.raises(RuntimeError, match="remains paused"):
         worker.recover_completion(run)
+
+
+@pytest.mark.parametrize("location", ["result.json", "session/state.json", "collaboration/group.json"])
+@pytest.mark.parametrize("flag", ["approval_rejection", "permission_denied"])
+def test_stop_preserves_canonical_permission_flags_before_release(tmp_path, monkeypatch, location, flag):
+    state, run, claim = fixture(tmp_path)
+    atomic(claim / location, {flag: True})
+    monkeypatch.setattr("native_swarm.commands.subprocess.Popen", Mock(return_value=SimpleNamespace(pid=99999999)))
+    record = issue(state, [claim], "stop_now", replace=True)[0]
+    release = Mock()
+    resume = Mock()
+    monkeypatch.setattr(worker, "release", release)
+    monkeypatch.setattr(Backend, "start", resume)
+    worker.execute(state, record["id"])
+    release.assert_not_called()
+    resume.assert_not_called()
+    assert (run / "approval-blocker-current.json").exists()
+    assert read(claim / "operator-command.json")["state"] == "review_required"

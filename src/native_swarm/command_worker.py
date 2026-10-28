@@ -365,9 +365,18 @@ def completion_window(run):
 
 def latch_permission_rejection(claim, streams, workspaces, source):
     """Preserve structured permission failures from any stopped model stream."""
-    from .group import rejection_event, member_rejection
+    from .group import rejection_event, member_rejection, group_rejected
 
-    rejected = any(member_rejection(workspace) for workspace in workspaces)
+    rejected = (
+        (claim.parent.parent / "approval-blocker-current.json").exists()
+        or group_rejected(claim)
+        or any(
+            read(claim / name).get(key)
+            for name in ("result.json", "session/state.json", "collaboration/group.json")
+            for key in ("approval_rejection", "permission_denied")
+        )
+        or any(member_rejection(workspace) for workspace in workspaces)
+    )
     reference = None
     for log, offset in streams:
         if not log.exists():

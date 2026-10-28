@@ -876,7 +876,7 @@ class SwarmApp(App):
     async def apply_command(self, value):
         try:
             scope, action = value.pop("scope"), value.pop("action")
-            rows = [r for r in self.data["rows"] if not r["closed"]]
+            rows = [r for r in self.data["rows"] if action == "acknowledge" or not r["closed"]]
             if scope == "selected":
                 rows = [r for r in rows if r["id"] == self.selected_worker]
             elif scope == "marked":
@@ -915,10 +915,17 @@ class SwarmApp(App):
                 ]
                 message = " · ".join(messages)
             elif action == "acknowledge":
-                runs = {str(Path(r["id"]).parent.parent) for r in rows}
+                if scope in ("selected", "marked"):
+                    runs = {str(Path(r["id"]).parent.parent) for r in rows}
+                else:
+                    runs = {
+                        value for value in self.backend.config.get("managed_runs", [])
+                        if scope == "all"
+                        or read(Path(value) / "native-app-profile.json").get("id") == scope
+                    }
                 if not runs:
                     raise ValueError(
-                        "Select a managed claim whose controller hold you want to acknowledge."
+                        "Select a managed worker, profile or controller scope to acknowledge."
                     )
                 message = " · ".join(
                     [
