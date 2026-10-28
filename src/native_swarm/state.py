@@ -215,6 +215,10 @@ class Projection:
                     if members
                     else int(alive)
                 )
+                handoff_pid = self.load(claim / "operator-handoff-process.json").get(
+                    "pid"
+                )
+                agents += int(process_alive(handoff_pid, run))
                 usage = {
                     t.get("id"): t
                     for t in self.load(run / "usage-current.json").get("threads", [])

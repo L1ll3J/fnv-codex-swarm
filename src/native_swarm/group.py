@@ -62,6 +62,10 @@ def score(path):
 
 def group_terminal(claim):
     claim = Path(claim)
+    from .commands import operator_terminal
+
+    if operator_terminal(claim):
+        return True
     directory = claim / "collaboration"
     if not directory.exists():
         return True

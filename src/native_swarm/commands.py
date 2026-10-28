@@ -195,6 +195,42 @@ def block_new_check(claim):
         block_new_batch(claim)
 
 
+def operator_terminal(claim):
+    """Verified operator termination is distinct from a successful model turn."""
+    from .state import process_alive
+
+    claim = Path(claim)
+    marker = read(claim / "operator-stop-terminal.json")
+    assignment = claim / "assignment.json"
+    if (
+        not marker.get("verified_stopped")
+        or not assignment.is_file()
+        or marker.get("assignment_sha256")
+        != hashlib.sha256(assignment.read_bytes()).hexdigest()
+    ):
+        return False
+    root = claim.parent.parent
+    pids = list(marker.get("pids", []))
+    pids.extend(
+        t.get("pid") for t in read(claim / "session/state.json").get("turns", [])
+    )
+    pids.extend(
+        m.get("pid")
+        for m in read(claim / "collaboration/group.json").get("members", [])
+    )
+    return not any(process_alive(pid, root) for pid in pids)
+
+
+def handoff_reserved(claim):
+    from .state import process_alive
+
+    claim = Path(claim)
+    value = read(claim / "operator-handoff-process.json")
+    return process_alive(value.get("pid"), claim.parent.parent) or bool(
+        value.get("intent") and not value.get("pid") and not value.get("finished")
+    )
+
+
 def operator_retiring(run):
     """Recognize only operator-originated retirement, never another saved failure."""
     run = Path(run)
@@ -224,6 +260,8 @@ def operator_retiring(run):
             in (
                 "stopping",
                 "evidence_preserved",
+                "writing_handoff",
+                "validating_match",
                 "releasing",
                 "completed",
                 "review_required",

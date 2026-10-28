@@ -94,9 +94,15 @@ def claim_request(root, dispatch, address=None):
             )
         ]
         ceiling = read(root / "run-config.json").get("authorized_worker_ceiling", 75)
+        from .policy import decision
+
+        try:
+            admission_target = decision(root)["target"]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError(WITHDRAWN + ": usage policy unavailable") from exc
         if (
             not wanted
-            or wanted["instances"] <= len(local)
+            or min(wanted["instances"], admission_target) <= len(local)
             or len(local) >= ceiling
             or (root / "operator-admissions-paused.json").exists()
             or (root / "operator-drain.json").exists()

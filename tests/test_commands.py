@@ -364,6 +364,7 @@ def test_authored_handoff_resumes_existing_thread_with_approved_message(
         ],
     )
     monkeypatch.setattr(worker.subprocess, "Popen", launch)
+    monkeypatch.setattr("native_swarm.commands.operator_terminal", lambda claim: True)
     worker.authored_handoff(claim, 15)
     assert seen["argv"][-2] == "original-thread"
     assert (
@@ -558,3 +559,179 @@ def test_completion_window_resumes_watcher_even_after_error(tmp_path):
     finally:
         proc.terminate()
         proc.wait(timeout=3)
+
+
+def test_operator_stop_frees_capacity_despite_unsealed_metadata(tmp_path, monkeypatch):
+    from native_swarm.assessment import occupied
+    from native_swarm.group import group_terminal
+    from native_swarm.commands import operator_terminal
+
+    state, run, claim = fixture(tmp_path)
+    atomic(
+        run / "rolling-executor/journal.json",
+        {"jobs": {"worker": {"claim_id": claim.name, "state": "launch_intent"}}},
+    )
+    atomic(claim / "session/state.json", {"streams_closed": False, "turns": []})
+    atomic(claim / "collaboration/group.json", {"state": "running", "members": []})
+    cfg = read(state / "config.json")
+    assert occupied(cfg, state) == 1
+    worker.stop_tree(claim, grace=0.01)
+    atomic(claim / "giveup-response.json", {"released": True})
+    assert operator_terminal(claim)
+    assert occupied(cfg, state) == 0
+    assert group_terminal(claim)
+    assert read(claim / "session/state.json")["streams_closed"] is False
+    assert read(claim / "collaboration/group.json")["state"] == "running"
+
+
+@pytest.mark.parametrize(
+    "location,field",
+    [
+        ("work/result.json", "permission_denied"),
+        ("result.json", "approval_rejection"),
+        ("session/state.json", "approval_rejection"),
+        ("collaboration/peer-1/result.json", "permission_denied"),
+    ],
+)
+def test_permission_rejection_blocks_handoff_before_model_launch(
+    tmp_path, monkeypatch, location, field
+):
+    _, run, claim = fixture(tmp_path)
+    atomic(claim / location, {field: True})
+    if "peer-1" in location:
+        atomic(
+            claim / "collaboration/group.json",
+            {"members": [{"workspace": str(claim / "collaboration/peer-1")}]},
+        )
+    launch = Mock()
+    monkeypatch.setattr(worker.subprocess, "Popen", launch)
+    worker.authored_handoff(claim, 15)
+    launch.assert_not_called()
+    assert (
+        read(claim / "operator-authored-handoff.json")["status"] == "blocked_permission"
+    )
+
+
+def test_handoff_launch_reserves_physical_capacity_and_closes_reservation(
+    tmp_path, monkeypatch
+):
+    from native_swarm.assessment import occupied
+
+    state, run, claim = fixture(tmp_path)
+    atomic(
+        claim / "session/state.json", {"thread_id": "existing", "streams_closed": True}
+    )
+    (claim / "work").mkdir()
+    monkeypatch.setattr("native_swarm.commands.operator_terminal", lambda _: True)
+    monkeypatch.setattr(
+        "native_swarm.session.command",
+        lambda root, assignment, thread: [
+            "codex",
+            "exec",
+            "-C",
+            str(root),
+            "resume",
+            thread,
+            "-",
+        ],
+    )
+    cfg = read(state / "config.json")
+    checked = []
+
+    class Proc:
+        pid = 99999999
+        returncode = 0
+
+        def communicate(self, value, timeout):
+            checked.append(occupied(cfg, state))
+
+        def poll(self):
+            return 0
+
+    def launch(*args, **kwargs):
+        assert occupied(cfg, state) == 1  # Durable launch intent consumes the slot.
+        return Proc()
+
+    monkeypatch.setattr(worker.subprocess, "Popen", launch)
+    monkeypatch.setattr(
+        "native_swarm.commands.process_alive", lambda *a: False, raising=False
+    )
+    # A saved live PID counts even after the launch-intent window.
+    monkeypatch.setattr(
+        "native_swarm.state.process_alive", lambda pid, root: pid == 99999999
+    )
+    worker.authored_handoff(claim, 15)
+    assert checked == [1]
+    assert read(claim / "operator-handoff-process.json")["finished"] is True
+    monkeypatch.setattr("native_swarm.state.process_alive", lambda *a: False)
+    assert occupied(cfg, state) == 0
+
+
+def test_full_capacity_skips_optional_handoff_without_extra_model(
+    tmp_path, monkeypatch
+):
+    state, run, claim = fixture(tmp_path)
+    atomic(claim / "session/state.json", {"thread_id": "existing"})
+    (claim / "work").mkdir()
+    monkeypatch.setattr("native_swarm.commands.operator_terminal", lambda _: True)
+    monkeypatch.setattr(
+        "native_swarm.session.command", lambda *a: ["codex", "-C", str(run)]
+    )
+    monkeypatch.setattr("native_swarm.assessment.occupied", lambda *a: 10)
+    launch = Mock()
+    monkeypatch.setattr(worker.subprocess, "Popen", launch)
+    worker.authored_handoff(claim, 15)
+    launch.assert_not_called()
+    assert (
+        read(claim / "operator-authored-handoff.json")["status"] == "skipped_capacity"
+    )
+
+
+def test_forced_kill_has_verified_terminal_capacity_evidence(tmp_path):
+    import signal, subprocess, sys
+    from native_swarm.assessment import occupied
+
+    state, run, claim = fixture(tmp_path)
+    code = 'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); print("ready",flush=True); time.sleep(60)'
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code, str(run), claim.name], stdout=subprocess.PIPE
+    )
+    try:
+        assert proc.stdout.readline().strip() == b"ready"
+        atomic(
+            run / "rolling-executor/journal.json",
+            {"jobs": {"worker": {"claim_id": claim.name, "pid": proc.pid}}},
+        )
+        atomic(
+            claim / "session/state.json",
+            {"streams_closed": False, "turns": [{"pid": proc.pid}]},
+        )
+        assert occupied(read(state / "config.json"), state) == 1
+        worker.stop_tree(claim, grace=0.01)
+        assert proc.wait(timeout=2) == -signal.SIGKILL
+        assert occupied(read(state / "config.json"), state) == 0
+        assert read(claim / "session/state.json")["streams_closed"] is False
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=3)
+        proc.stdout.close()
+
+
+def test_ambiguous_handoff_launch_keeps_capacity_until_observed(tmp_path):
+    from native_swarm.assessment import occupied
+
+    state, _, claim = fixture(tmp_path)
+    atomic(
+        claim / "operator-handoff-process.json",
+        {
+            "intent": True,
+            "workspace": str(claim / "work"),
+            "thread_id": "missing-thread",
+        },
+    )
+    assert occupied(read(state / "config.json"), state) == 1
+    with pytest.raises(RuntimeError, match="identity is incomplete"):
+        worker.stop_tree(claim)
+    assert occupied(read(state / "config.json"), state) == 1
+    assert not read(claim / "operator-stop-terminal.json")

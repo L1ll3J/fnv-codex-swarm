@@ -35,6 +35,37 @@ def stop_tree(claim, grace=10):
     jobs = read(run / "rolling-executor/journal.json").get("jobs", {})
     roots = {j.get("pid") for j in jobs.values() if j.get("claim_id") == claim.name}
     roots.discard(None)
+    handoff = read(claim / "operator-handoff-process.json")
+    handoff_pids = set()
+    if handoff.get("intent") and not handoff.get("finished"):
+        for path in Path("/proc").iterdir():
+            if not path.name.isdecimal():
+                continue
+            try:
+                argv = (path / "cmdline").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            if (
+                handoff.get("workspace")
+                and handoff.get("thread_id")
+                and handoff["workspace"].encode() in argv
+                and handoff["thread_id"].encode() in argv
+                and b"resume" in argv
+                and b"exec" in argv
+            ):
+                handoff_pids.add(int(path.name))
+        if handoff.get("pid"):
+            handoff_pids.add(handoff["pid"])
+    if (
+        handoff.get("intent")
+        and not handoff.get("finished")
+        and not handoff.get("pid")
+        and not handoff_pids
+    ):
+        raise RuntimeError(
+            "Handoff launch identity is incomplete; no process is assumed dead. Retry reconciliation once its process identity becomes observable."
+        )
+    roots |= handoff_pids
     snapshot = process_snapshot()
     known = set()
     for pid in roots:
@@ -42,7 +73,16 @@ def stop_tree(claim, grace=10):
             argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
         except OSError:
             continue
-        if claim.name.encode() not in argv or str(run).encode() not in argv:
+        handoff_identity = (
+            pid in handoff_pids
+            and handoff.get("workspace", "").encode() in argv
+            and handoff.get("thread_id", "").encode() in argv
+            and b"resume" in argv
+            and b"exec" in argv
+        )
+        if not handoff_identity and (
+            claim.name.encode() not in argv or str(run).encode() not in argv
+        ):
             if process_alive(pid, run):
                 raise RuntimeError(
                     "Worker process identity needs reconciliation before signalling."
@@ -94,6 +134,25 @@ def stop_tree(claim, grace=10):
             raise RuntimeError(
                 "An orphaned worker remains; inspect its process before release."
             )
+    if handoff.get("intent") and not handoff.get("finished"):
+        atomic(
+            claim / "operator-handoff-process.json",
+            {**handoff, "finished": True, "stopped_by_operator": True},
+        )
+    assignment = claim / "assignment.json"
+    if assignment.is_file():
+        atomic(
+            claim / "operator-stop-terminal.json",
+            {
+                "verified_stopped": True,
+                "assignment_sha256": hashlib.sha256(
+                    assignment.read_bytes()
+                ).hexdigest(),
+                "pids": sorted(known),
+                "stopped_at": time.time(),
+                "reason": "Operator stop; no successful model completion is implied.",
+            },
+        )
 
 
 def is_match(best):
@@ -259,9 +318,30 @@ def completion_window(run):
 def authored_handoff(claim, timeout):
     """Resume an existing context once; checking stays closed by the operator command."""
     from .session import command
+    from .group import group_rejected
+    from .commands import operator_terminal
+    from .assessment import occupied
 
     run = claim.parent.parent
     assignment = read(claim / "assignment.json")
+    blocked = (
+        (run / "approval-blocker-current.json").exists()
+        or group_rejected(claim)
+        or any(
+            read(claim / name).get(key)
+            for name in ("result.json", "work/result.json", "session/state.json")
+            for key in ("approval_rejection", "permission_denied")
+        )
+    )
+    if blocked:
+        atomic(
+            claim / "operator-authored-handoff.json",
+            {
+                "status": "blocked_permission",
+                "reason": "Retained permission rejection; mechanical evidence preserved without model continuation.",
+            },
+        )
+        return
     session = read(claim / "session/state.json")
     thread = session.get("thread_id")
     workspace = claim / "work"
@@ -281,17 +361,46 @@ def authored_handoff(claim, timeout):
     argv = command(run, assignment, thread)
     argv[argv.index("-C") + 1] = str(workspace)
     with (
-        (claim / "operator-authored-handoff.jsonl").open("wb") as out,
-        (claim / "operator-authored-handoff.stderr").open("wb") as err,
+        (claim / "operator-authored-handoff.jsonl").open("ab") as out,
+        (claim / "operator-authored-handoff.stderr").open("ab") as err,
     ):
-        proc = subprocess.Popen(
-            argv,
-            cwd=workspace,
-            stdin=subprocess.PIPE,
-            stdout=out,
-            stderr=err,
-            start_new_session=True,
-        )
+        state = Path(read(run / "native-app-managed.json")["state_dir"])
+        with locked(state / "capacity.lock"):
+            cfg = read(state / "config.json")
+            if not operator_terminal(claim) or occupied(cfg, state) >= cfg.get(
+                "worker_capacity", 10
+            ):
+                atomic(
+                    claim / "operator-authored-handoff.json",
+                    {
+                        "status": "skipped_capacity",
+                        "reason": "No free verified slot; mechanical handoff preserved.",
+                    },
+                )
+                return
+            launch = {
+                "intent": True,
+                "workspace": str(workspace),
+                "thread_id": thread,
+                "started_at": time.time(),
+            }
+            atomic(claim / "operator-handoff-process.json", launch)
+            try:
+                proc = subprocess.Popen(
+                    argv,
+                    cwd=workspace,
+                    stdin=subprocess.PIPE,
+                    stdout=out,
+                    stderr=err,
+                    start_new_session=True,
+                )
+            except OSError:
+                atomic(
+                    claim / "operator-handoff-process.json",
+                    {**launch, "finished": True, "launch_failed": True},
+                )
+                raise
+            atomic(claim / "operator-handoff-process.json", {**launch, "pid": proc.pid})
         try:
             proc.communicate(
                 (Path(__file__).parent / "prompts/operator_handoff.xml").read_bytes(),
@@ -314,6 +423,15 @@ def authored_handoff(claim, timeout):
                 except subprocess.TimeoutExpired:
                     os.killpg(proc.pid, signal.SIGKILL)
                     proc.wait()
+            atomic(
+                claim / "operator-handoff-process.json",
+                {
+                    **launch,
+                    "pid": proc.pid,
+                    "finished": True,
+                    "exit_code": proc.returncode,
+                },
+            )
         atomic(
             claim / "operator-authored-handoff.json",
             {"status": status, "thread_id": thread, "exit_code": proc.returncode},
@@ -426,7 +544,8 @@ def submit_match(claim, record, best):
     if existing.exists():
         history = claim / "operator-result-history"
         history.mkdir(exist_ok=True)
-        atomic(history / (record["id"] + ".json"), read(existing))
+        if not (history / (record["id"] + ".json")).exists():
+            atomic(history / (record["id"] + ".json"), read(existing))
     atomic(existing, value)
     atomic(
         claim / "operator-submit-intent.json",
@@ -565,6 +684,7 @@ def execute(state, identifier):
                     and checked_progress(claim)["events"]
                 )
             ):
+                update(state, record, "writing_handoff")
                 authored_handoff(claim, record["timeout"])
                 best = preserve(claim)
             update(state, record, "evidence_preserved")

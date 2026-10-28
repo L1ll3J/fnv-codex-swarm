@@ -179,6 +179,10 @@ def assessor_running(state):
 
 def claim_reserved(claim, root):
     """Retain physical capacity for survivors and ambiguous supervisor exits."""
+    from .commands import operator_terminal
+
+    if operator_terminal(claim):
+        return False
     session = claim / "session"
     if session.exists():
         state = read(session / "state.json")
@@ -201,6 +205,8 @@ def claim_reserved(claim, root):
 
 
 def occupied(cfg, state=None):
+    from .commands import operator_terminal, handoff_reserved
+
     total = 0
     for root in paths(cfg):
         journal = read(root / "rolling-executor/journal.json")
@@ -216,8 +222,12 @@ def occupied(cfg, state=None):
                 process_alive(job.get("pid"), root)
                 or claim_reserved(claim, root)
                 or job.get("state") == "launch_intent"
+                and not operator_terminal(claim)
             ):
                 total += group_size
+        for path in (root / "claims").glob("*/operator-handoff-process.json"):
+            if handoff_reserved(path.parent):
+                total += 1
     return total
 
 

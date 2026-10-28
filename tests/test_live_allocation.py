@@ -294,8 +294,9 @@ def test_resume_replaces_operator_drained_generation_without_clearing_drain(
     assert "started" in b.start()
     assert create.call_count == 1
     assert (sol / "operator-drain.json").exists()
-    assert read(sol / "operator-admissions-paused.json")["source"] == "operator-retirement"
-
+    assert (
+        read(sol / "operator-admissions-paused.json")["source"] == "operator-retirement"
+    )
 
 
 def test_resume_checks_capacity_before_creating_missing_profile(tmp_path, monkeypatch):
@@ -444,3 +445,24 @@ def test_edit_does_not_schedule_handover_under_manual_pause(tmp_path, monkeypatc
     selected[0]["instances"] = 1
     b.save_profiles(selected)
     request.assert_not_called()
+
+
+def test_dispatch_rechecks_paused_and_idled_targets(tmp_path, monkeypatch):
+    import pytest
+    from native_swarm.allocation import claim_request, WITHDRAWN
+
+    b, sol, _, _ = fixture(tmp_path, monkeypatch)
+    (sol / "claims").mkdir()
+    atomic(sol / "run-config.json", {"authorized_worker_ceiling": 75})
+    cfg = b.config
+    cfg["paused_profiles"] = ["default"]
+    atomic(b.state / "config.json", cfg)
+    dispatch = Mock()
+    with pytest.raises(RuntimeError, match=WITHDRAWN):
+        claim_request(sol, dispatch)
+    cfg["paused_profiles"] = []
+    atomic(b.state / "config.json", cfg)
+    atomic(b.state / "idle-slots.json", {"default": 2})
+    with pytest.raises(RuntimeError, match=WITHDRAWN):
+        claim_request(sol, dispatch)
+    dispatch.assert_not_called()
