@@ -126,10 +126,9 @@ def main():
 
     state, root = map(Path, sys.argv[1:])
     with (root / "profile-handover.lock").open("a") as guard:
-        try:
-            fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return
+        # A successor waits for a finishing watcher rather than losing a newly
+        # published request in the interval between its final tick and exit.
+        fcntl.flock(guard, fcntl.LOCK_EX)
         backend = Backend(state)
         while True:
             try:
