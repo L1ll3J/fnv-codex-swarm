@@ -349,6 +349,9 @@ def test_authored_handoff_resumes_existing_thread_with_approved_message(
         def poll(self):
             return 0
 
+        def wait(self, timeout=None):
+            return self.returncode
+
     def launch(argv, **kwargs):
         seen["argv"] = argv
         return Proc()
@@ -651,6 +654,9 @@ def test_handoff_launch_reserves_physical_capacity_and_closes_reservation(
         def poll(self):
             return 0
 
+        def wait(self, timeout=None):
+            return self.returncode
+
     def launch(*args, **kwargs):
         assert occupied(cfg, state) == 1  # Durable launch intent consumes the slot.
         return Proc()
@@ -764,6 +770,9 @@ def test_new_handoff_rejection_latches_permission_stop(tmp_path, monkeypatch):
         def poll(self):
             return 1
 
+        def wait(self, timeout=None):
+            return self.returncode
+
     def launch(argv, **kwargs):
         kwargs["stdout"].write(
             (json.dumps({"type": "error", "code": "approval_denied"}) + "\n").encode()
@@ -829,6 +838,9 @@ def test_cancelled_handoff_latches_rejection_before_propagating_stop(
 
         def poll(self):
             return 1
+
+        def wait(self, timeout=None):
+            return self.returncode
 
     def launch(argv, **kwargs):
         kwargs["stdout"].write(
@@ -1122,3 +1134,34 @@ def test_stop_withholds_terminal_marker_for_orphaned_private_session(tmp_path):
             os.kill(child, signal.SIGKILL)
         except ProcessLookupError:
             pass
+
+
+def test_handoff_reaps_tools_after_direct_parent_exits(tmp_path, monkeypatch):
+    import sys
+    from native_swarm.commands import handoff_reserved
+
+    _, run, claim = fixture(tmp_path)
+    (claim / "work").mkdir()
+    atomic(claim / "session/state.json", {"thread_id": "existing"})
+    child_file = tmp_path / "handoff-child"
+    code = (
+        "import subprocess,sys; from pathlib import Path; "
+        "p=subprocess.Popen([sys.executable,'-c','import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(60)']); "
+        f"Path({str(child_file)!r}).write_text(str(p.pid))"
+    )
+    monkeypatch.setattr("native_swarm.commands.operator_terminal", lambda _: True)
+    monkeypatch.setattr("native_swarm.session.command", lambda *args: [sys.executable, "-c", code, "-C", str(claim / "work")])
+    worker.authored_handoff(claim, 5)
+    child = int(child_file.read_text())
+    path = Path(f"/proc/{child}/stat")
+    assert not path.exists() or path.read_text().rsplit(")", 1)[1].split()[0] == "Z"
+    assert read(claim / "operator-handoff-process.json")["finished"]
+    assert not handoff_reserved(claim)
+
+
+def test_unsettled_handoff_reserves_capacity_after_parent_exit(tmp_path):
+    from native_swarm.commands import handoff_reserved
+
+    _, _, claim = fixture(tmp_path)
+    atomic(claim / "operator-handoff-process.json", {"intent": True, "pid": 99999999, "finished": False})
+    assert handoff_reserved(claim)

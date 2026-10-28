@@ -228,7 +228,7 @@ def handoff_reserved(claim):
     claim = Path(claim)
     value = read(claim / "operator-handoff-process.json")
     return process_alive(value.get("pid"), claim.parent.parent) or bool(
-        value.get("intent") and not value.get("pid") and not value.get("finished")
+        value.get("intent") and not value.get("finished")
     )
 
 

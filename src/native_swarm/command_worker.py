@@ -549,6 +549,7 @@ def authored_handoff(claim, timeout):
             "log_offset": offset,
             "started_at": time.time(),
         }
+        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
         try:
             with locked(state / "capacity.lock"):
                 cfg = read(state / "config.json")
@@ -582,6 +583,7 @@ def authored_handoff(claim, timeout):
                 atomic(
                     claim / "operator-handoff-process.json", {**launch, "pid": proc.pid}
                 )
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
             proc.communicate(
                 (Path(__file__).parent / "prompts/operator_handoff.xml").read_bytes(),
                 timeout=timeout,
@@ -590,37 +592,29 @@ def authored_handoff(claim, timeout):
         except subprocess.TimeoutExpired:
             status = "timed_out"
         finally:
-            if proc is not None:
-                if proc.poll() is None:
-                    os.killpg(proc.pid, signal.SIGTERM)
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+            try:
+                if proc is not None:
                     try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                        proc.wait()
-                atomic(
-                    claim / "operator-handoff-process.json",
-                    {
-                        **launch,
-                        "pid": proc.pid,
-                        "finished": True,
-                        "exit_code": proc.returncode,
-                    },
-                )
-                out.flush()
-                rejected = latch_handoff_rejection(claim, workspace, offset)
-                atomic(
-                    claim / "operator-authored-handoff.json",
-                    {
-                        "status": "blocked_permission" if rejected else status,
-                        "thread_id": thread,
-                        "exit_code": proc.returncode,
-                    },
-                )
-                if rejected:
-                    raise PermissionError(
-                        "Handoff reported a permission rejection; evidence and claim retained, admissions not resumed."
+                        quiesce_private_session(proc)
+                    finally:
+                        out.flush()
+                        rejected = latch_handoff_rejection(claim, workspace, offset)
+                    atomic(
+                        claim / "operator-handoff-process.json",
+                        {**launch, "pid": proc.pid, "finished": True, "exit_code": proc.returncode},
                     )
+                    atomic(
+                        claim / "operator-authored-handoff.json",
+                        {"status": "blocked_permission" if rejected else status,
+                         "thread_id": thread, "exit_code": proc.returncode},
+                    )
+                    if rejected:
+                        raise PermissionError(
+                            "Handoff reported a permission rejection; evidence and claim retained, admissions not resumed."
+                        )
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 
 
 def submit_match(claim, record, best):
@@ -748,6 +742,43 @@ def submit_match(claim, record, best):
         )
 
 
+def quiesce_private_session(proc):
+    """Reap a privately launched session, including children of an exited parent."""
+    # All checker/RPC/transport descendants inherit this private
+    # session. Pin each observed member before signalling it.
+    deadline = time.monotonic() + 10
+    while True:
+        members = []
+        for path in Path("/proc").iterdir():
+            if not path.name.isdecimal():
+                continue
+            try:
+                fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
+                if fields[0] != "Z" and int(fields[3]) == proc.pid:
+                    members.append((int(path.name), fields[19]))
+            except (OSError, ValueError, IndexError):
+                continue
+        if not members:
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Resolution descendants remain; retry is withheld.")
+        for pid, birth in members:
+            try:
+                fd = os.pidfd_open(pid)
+            except ProcessLookupError:
+                continue
+            try:
+                fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+                if fields[19] == birth and int(fields[3]) == proc.pid:
+                    signal.pidfd_send_signal(fd, signal.SIGKILL)
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+            finally:
+                os.close(fd)
+        time.sleep(0.01)
+    proc.wait(timeout=5)
+
+
 def resolution_rpc(claim, argv, *, timeout, input=None):
     """Keep nested transports quiescent before a command can finish or retry."""
     marker = claim / "operator-resolution-process.json"
@@ -773,39 +804,7 @@ def resolution_rpc(claim, argv, *, timeout, input=None):
         signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
         try:
             if proc is not None:
-                # All checker/RPC/transport descendants inherit this private
-                # session. Pin each observed member before signalling it.
-                deadline = time.monotonic() + 10
-                while True:
-                    members = []
-                    for path in Path("/proc").iterdir():
-                        if not path.name.isdecimal():
-                            continue
-                        try:
-                            fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
-                            if fields[0] != "Z" and int(fields[3]) == proc.pid:
-                                members.append((int(path.name), fields[19]))
-                        except (OSError, ValueError, IndexError):
-                            continue
-                    if not members:
-                        break
-                    if time.monotonic() >= deadline:
-                        raise RuntimeError("Resolution descendants remain; retry is withheld.")
-                    for pid, birth in members:
-                        try:
-                            fd = os.pidfd_open(pid)
-                        except ProcessLookupError:
-                            continue
-                        try:
-                            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-                            if fields[19] == birth and int(fields[3]) == proc.pid:
-                                signal.pidfd_send_signal(fd, signal.SIGKILL)
-                        except (FileNotFoundError, ProcessLookupError):
-                            pass
-                        finally:
-                            os.close(fd)
-                    time.sleep(0.01)
-                proc.wait(timeout=5)
+                quiesce_private_session(proc)
                 atomic(marker, {**record, "quiesced": True, "finished_at": time.time()})
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
