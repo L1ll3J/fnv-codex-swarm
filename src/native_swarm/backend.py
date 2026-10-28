@@ -150,13 +150,15 @@ class Backend:
                 if selected:
                     control = read(run / "operator-control.json")
                     control["native_app_selection"] = {
-                        key: selected.get(key, 20 if key == "rounds" else "shared")
+                        key: selected.get(key, {"rounds": 20, "budget_mode": "shared", "extend_while_improving": True, "improvement_window": 3}.get(key))
                         for key in (
                             "priority",
                             "queue_first",
                             "bands",
                             "rounds",
                             "budget_mode",
+                            "extend_while_improving",
+                            "improvement_window",
                         )
                     }
                     control["native_app_bands"] = selected["bands"]
@@ -322,15 +324,22 @@ class Backend:
                 profiles = [p for p in profiles if p["instances"] > 0]
                 by_id = {p["id"]: p for p in profiles}
                 represented = set()
+                retired = []
                 for run in active:
                     running = read(run / "native-app-profile.json")
                     wanted = selected_profile(run, cfg)
                     if running.get("id") in by_id and wanted is None:
-                        raise ControlError(
-                            f"Profile {running['id']} has an active controller with different "
-                            "model, reasoning or team size. Its current tasks must finish "
-                            "and its controller must stop before starting the replacement."
-                        )
+                        from .handover import retire_idle
+
+                        try:
+                            retire_idle(run, self.state)
+                        except RuntimeError as exc:
+                            raise ControlError(
+                                f"Profile {running['id']} is waiting for its existing work "
+                                f"before handover: {exc}"
+                            ) from exc
+                        retired.append(run)
+                        continue
                     if wanted and wanted["instances"] > 0:
                         if wanted["id"] in represented:
                             raise ControlError(
@@ -338,6 +347,7 @@ class Backend:
                                 "resolve their ownership before resuming."
                             )
                         represented.add(wanted["id"])
+                active = [run for run in active if run not in retired]
                 missing = [p for p in profiles if p["id"] not in represented]
                 if missing:
                     # Never replace a controller that lost ownership while its
@@ -356,7 +366,7 @@ class Backend:
                             )
                     template = Path(cfg["template_run"])
                     self.verify_template(template, cfg)
-                account = self.preflight(active[0], require_idle=False)
+                account = self.preflight(active[0] if active else template, require_idle=False)
                 created = []
                 try:
                     for profile in missing:

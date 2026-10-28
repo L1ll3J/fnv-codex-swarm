@@ -262,7 +262,7 @@ def test_resume_refuses_changed_identity_until_original_controller_stops(
     b.save_profiles(selected)
     create = Mock()
     monkeypatch.setattr(b, "create_run", create)
-    with pytest.raises(ControlError, match="different model, reasoning or team size"):
+    with pytest.raises(ControlError, match="waiting for its existing work"):
         b.start()
     assert read(sol / "native-app-profile.json")["model"] == "gpt-6.1-sol"
     create.assert_not_called()
@@ -383,3 +383,28 @@ def test_resume_failed_multi_profile_start_pauses_only_new_controllers(
         b.start()
     assert read(sol / "operator-admissions-paused.json")["reason"] == "manual pause"
     assert read(new_run / "operator-admissions-paused.json")["reason"] == "profile start incomplete"
+
+
+def test_resume_retires_idle_changed_profile_and_starts_replacement(tmp_path, monkeypatch):
+    b, sol, terra, team = resume_fixture(tmp_path, monkeypatch)
+    selected = b.profiles()
+    selected[0]["model"] = "gpt-6.1-terra"
+    b.save_profiles(selected)
+    atomic(sol / "rolling-executor/journal.json", {"jobs": {}})
+    live = {1, 2, 3}
+    monkeypatch.setattr("native_swarm.backend.process_alive", lambda pid, root: pid in live)
+    monkeypatch.setattr("native_swarm.handover.process_alive", lambda pid, root: pid in live)
+    stopped = []
+    def terminate(pid, root):
+        live.remove(pid)
+        stopped.append(root)
+    monkeypatch.setattr("native_swarm.handover.terminate_controller", terminate)
+    create = Mock()
+    monkeypatch.setattr(b, "create_run", create)
+    assert "started 1 new profile" in b.start()
+    assert stopped == [sol]
+    assert live == {2, 3}
+    assert create.call_args.args[3]["id"] == "default"
+    assert create.call_args.args[3]["model"] == "gpt-6.1-terra"
+    assert read(sol / "operator-profile-handover.json")["state"] == "retired"
+    b.preflight.assert_called_once_with(terra, require_idle=False)
