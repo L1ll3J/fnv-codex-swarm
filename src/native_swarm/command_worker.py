@@ -31,8 +31,25 @@ def process_snapshot():
 
 
 def stop_tree(claim, grace=10):
+    """Order process observation and termination against controller launches."""
+    run = claim.parent.parent
+    state = Path(read(run / "native-app-managed.json")["state_dir"])
+    with locked(state / "capacity.lock"):
+        _stop_tree(claim, grace)
+
+
+def _stop_tree(claim, grace=10):
     run = claim.parent.parent
     jobs = read(run / "rolling-executor/journal.json").get("jobs", {})
+    if any(
+        j.get("claim_id") == claim.name
+        and j.get("state") == "launch_intent"
+        and not j.get("pid")
+        for j in jobs.values()
+    ):
+        raise RuntimeError(
+            "Worker launch identity is incomplete; reconcile its launch before release."
+        )
     roots = {j.get("pid") for j in jobs.values() if j.get("claim_id") == claim.name}
     roots.discard(None)
     handoff = read(claim / "operator-handoff-process.json")

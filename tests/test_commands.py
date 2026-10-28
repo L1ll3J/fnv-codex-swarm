@@ -569,7 +569,7 @@ def test_operator_stop_frees_capacity_despite_unsealed_metadata(tmp_path, monkey
     state, run, claim = fixture(tmp_path)
     atomic(
         run / "rolling-executor/journal.json",
-        {"jobs": {"worker": {"claim_id": claim.name, "state": "launch_intent"}}},
+        {"jobs": {"worker": {"claim_id": claim.name, "state": "running", "pid": 99999999}}},
     )
     atomic(claim / "session/state.json", {"streams_closed": False, "turns": []})
     atomic(claim / "collaboration/group.json", {"state": "running", "members": []})
@@ -916,3 +916,58 @@ def test_forced_stop_preserves_rejection_from_normal_worker_stream(tmp_path, str
     assert read(run / "approval-blocker-current.json")["source"] == "operator-stop"
     assert not operator_retiring(run)
     assert read(claim / "operator-stop-terminal.json")["verified_stopped"] is True
+
+
+def test_stop_orders_against_launch_and_refuses_unpublished_identity(tmp_path):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from native_swarm.group_check import locked
+
+    state, run, claim = fixture(tmp_path)
+    journal = run / "rolling-executor/journal.json"
+    atomic(journal, {"jobs": {"worker": {"claim_id": claim.name, "state": "launch_intent"}}})
+    with pytest.raises(RuntimeError, match="launch identity is incomplete"):
+        worker.stop_tree(claim, grace=0.01)
+    assert not (claim / "operator-stop-terminal.json").exists()
+    entered = threading.Event()
+
+    def stop():
+        entered.set()
+        worker.stop_tree(claim, grace=0.01)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with locked(state / "capacity.lock"):
+            future = pool.submit(stop)
+            assert entered.wait(2)
+            assert not future.done()
+            assert not (claim / "operator-stop-terminal.json").exists()
+            atomic(journal, {"jobs": {"worker": {"claim_id": claim.name, "state": "running", "pid": 99999999}}})
+        future.result(timeout=3)
+    assert read(claim / "operator-stop-terminal.json")["verified_stopped"]
+
+
+@pytest.mark.parametrize("marker", ["operator-drain.json", "claims/clm_test/operator-command.json"])
+def test_controller_cannot_launch_after_operator_stop(tmp_path, monkeypatch, marker):
+    import runpy
+    import sys
+    from types import ModuleType
+    import native_swarm
+
+    state, run, claim = fixture(tmp_path)
+    random = ModuleType("random_executor")
+    random.RandomExecutor = type("RandomExecutor", (), {})
+    rolling = ModuleType("rolling_executor")
+    rolling.read_json = read
+    monkeypatch.setitem(sys.modules, "random_executor", random)
+    monkeypatch.setitem(sys.modules, "rolling_executor", rolling)
+    values = runpy.run_path(str(Path(native_swarm.__file__).with_name("controller.py")))
+    controller = values["ManagedExecutor"]()
+    controller.root = run
+    controller.active = {}
+    controller.usage_decision = lambda: {"target": 1}
+    controller.journal = {"jobs": {"worker": {"state": "prepared"}}}
+    controller.journal_save = Mock()
+    controller.launch_supervised = Mock()
+    atomic(run / marker, {"action": "stop_now"})
+    assert controller.launch("worker", claim.name, {}) is False
+    controller.launch_supervised.assert_not_called()

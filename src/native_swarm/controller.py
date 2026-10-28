@@ -208,6 +208,8 @@ class ManagedExecutor(RandomExecutor):
                 value is None
                 or len(self.active) >= value["target"]
                 or (self.root / "operator-admissions-paused.json").exists()
+                or (self.root / "operator-drain.json").exists()
+                or (self.root / "claims" / claim_dir / "operator-command.json").exists()
             ):
                 self.journal["jobs"][worker]["state"] = (
                     "prepared_waiting_transient_gate"
