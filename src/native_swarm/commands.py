@@ -335,6 +335,14 @@ def retry(state, value):
                 raise ValueError(
                     "The command is still running; wait for it to finish."
                 ) from exc
+            pending = any(
+                (claim / name).exists()
+                for name in ("operator-release-intent.json", "operator-submit-intent.json")
+            )
+            if pending and not read(claim / "operator-resolution-process.json").get("quiesced"):
+                raise ValueError(
+                    "The previous resolution process is not confirmed quiescent; retain its intent and reconcile before retrying."
+                )
             for name in ("operator-release-intent.json", "operator-submit-intent.json"):
                 intent = claim / name
                 if intent.exists():

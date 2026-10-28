@@ -236,8 +236,17 @@ def preserve(claim):
     return best
 
 
+def resolution_pending(run):
+    return any(
+        read(path).get("intent") and not read(path).get("quiesced")
+        for path in (run / "claims").glob("*/operator-resolution-process.json")
+    )
+
+
 def restore_completion(run):
     """Recover a stopped CPU watcher after an interrupted operator command."""
+    if resolution_pending(run):
+        raise RuntimeError("An external resolution process is uncertain; completion processing remains paused for reconciliation.")
     marker = read(run / "operator-completion-window.json")
     if marker.get("state") != "paused":
         return
@@ -344,13 +353,14 @@ def completion_window(run):
             yield
         finally:
             if fd is not None:
-                if paused:
+                if paused and not resolution_pending(run):
                     try:
                         signal.pidfd_send_signal(fd, signal.SIGCONT)
                     except ProcessLookupError:
                         pass
                 os.close(fd)
-                restore_completion(run)
+                if not resolution_pending(run):
+                    restore_completion(run)
 
 
 def latch_permission_rejection(claim, streams, workspaces, source):
@@ -654,11 +664,9 @@ def submit_match(claim, record, best):
         claim / "operator-submit-intent.json",
         {"command": record["id"], "state": "dispatch_started", "receipt": str(best[1])},
     )
-    result = subprocess.run(
+    result = resolution_rpc(
+        claim,
         [sys.executable, str(run / "validate_submit.py"), claim.name],
-        cwd=run,
-        capture_output=True,
-        text=True,
         timeout=300,
     )
     (claim / "operator-submit.log").write_text(result.stdout + result.stderr)
@@ -666,6 +674,69 @@ def submit_match(claim, record, best):
         raise RuntimeError(
             "Independent MATCH validation/submission needs review; inspect operator-submit.log. No automatic submission retry."
         )
+
+
+def resolution_rpc(claim, argv, *, timeout, input=None):
+    """Keep nested transports quiescent before a command can finish or retry."""
+    marker = claim / "operator-resolution-process.json"
+    previous = read(marker)
+    if previous and not previous.get("quiesced"):
+        raise RuntimeError("Previous resolution process is uncertain; reconcile it before redispatch.")
+    record = {"intent": True, "quiesced": False, "started_at": time.time()}
+    atomic(marker, record)
+    proc = None
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        proc = subprocess.Popen(
+            argv, cwd=claim.parent.parent, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
+        )
+        record["pid"] = proc.pid
+        atomic(marker, record)
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        stdout, stderr = proc.communicate(input=input, timeout=timeout)
+        return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+    finally:
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+        try:
+            if proc is not None:
+                # All checker/RPC/transport descendants inherit this private
+                # session. Pin each observed member before signalling it.
+                deadline = time.monotonic() + 10
+                while True:
+                    members = []
+                    for path in Path("/proc").iterdir():
+                        if not path.name.isdecimal():
+                            continue
+                        try:
+                            fields = (path / "stat").read_text().rsplit(")", 1)[1].split()
+                            if fields[0] != "Z" and int(fields[3]) == proc.pid:
+                                members.append((int(path.name), fields[19]))
+                        except (OSError, ValueError, IndexError):
+                            continue
+                    if not members:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Resolution descendants remain; retry is withheld.")
+                    for pid, birth in members:
+                        try:
+                            fd = os.pidfd_open(pid)
+                        except ProcessLookupError:
+                            continue
+                        try:
+                            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+                            if fields[19] == birth and int(fields[3]) == proc.pid:
+                                signal.pidfd_send_signal(fd, signal.SIGKILL)
+                        except (FileNotFoundError, ProcessLookupError):
+                            pass
+                        finally:
+                            os.close(fd)
+                    time.sleep(0.01)
+                proc.wait(timeout=5)
+                atomic(marker, {**record, "quiesced": True, "finished_at": time.time()})
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 
 
 def release(claim, record, best=None):
@@ -702,12 +773,10 @@ def release(claim, record, best=None):
         payload["best_code"] = Path(best[2]["source_path"]).read_text()
         payload["model"] = read(claim / "assignment.json")["model"]
     rpc = "from service import call,save; import json,sys; result=call('giveup',json.load(sys.stdin)); save('claims/'+sys.argv[1]+'/giveup-response.json',result); print(json.dumps(result))"
-    result = subprocess.run(
+    result = resolution_rpc(
+        claim,
         [sys.executable, "-c", rpc, claim.name],
-        cwd=run,
         input=json.dumps(payload),
-        capture_output=True,
-        text=True,
         timeout=90,
     )
     (claim / "operator-release.log").write_text(result.stdout + result.stderr)

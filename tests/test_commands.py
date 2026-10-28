@@ -195,6 +195,7 @@ def test_explicit_retry_archives_intent_and_rechecks_ownership(tmp_path, monkeyp
     record = issue(state, [claim], "stop_now")[0]
     atomic(claim / "operator-command.json", {**record, "state": "review_required"})
     atomic(claim / "operator-release-intent.json", {"command": record["id"]})
+    atomic(claim / "operator-resolution-process.json", {"quiesced": True})
     retry(state, claim)
     assert not (claim / "operator-release-intent.json").exists()
     assert list((claim / "operator-release-history").glob("*.json"))
@@ -458,6 +459,7 @@ def test_recovered_match_uses_finish_evidence_audit_and_independent_validation(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(worker.subprocess, "run", execute)
+    monkeypatch.setattr(worker, "resolution_rpc", lambda claim, argv, **kwargs: execute(argv, **kwargs))
     worker.submit_match(claim, {"id": "operator"}, worker.preserve(claim))
     assert [Path(a[1]).name for a in calls[:2]] == ["usage.py", "register_usage.py"]
     assert calls[2][1] == str(driver) and "--finish" in calls[2]
@@ -507,6 +509,7 @@ def test_failed_independent_gate_keeps_intent_without_retry(tmp_path, monkeypatc
         )
 
     monkeypatch.setattr(worker.subprocess, "run", execute)
+    monkeypatch.setattr(worker, "resolution_rpc", lambda claim, argv, **kwargs: execute(argv, **kwargs))
     with pytest.raises(RuntimeError, match="Independent MATCH"):
         worker.submit_match(claim, {"id": "operator"}, worker.preserve(claim))
     assert read(claim / "operator-submit-intent.json")["state"] == "dispatch_started"
@@ -971,3 +974,53 @@ def test_controller_cannot_launch_after_operator_stop(tmp_path, monkeypatch, mar
     atomic(run / marker, {"action": "stop_now"})
     assert controller.launch("worker", claim.name, {}) is False
     controller.launch_supervised.assert_not_called()
+
+
+def test_resolution_cancellation_settles_nested_transport_before_exit(tmp_path):
+    import os
+    import subprocess
+    import sys
+    import time
+    import native_swarm
+
+    _, run, claim = fixture(tmp_path)
+    ready, late = tmp_path / "transport-ready", tmp_path / "late-write"
+    transport = f"from pathlib import Path; import time; Path({str(ready)!r}).touch(); time.sleep(1); Path({str(late)!r}).touch()"
+    rpc = f"import subprocess,sys; subprocess.run([sys.executable,'-c',{transport!r}],check=True)"
+    daemon = (
+        "from pathlib import Path; import signal,sys; "
+        "from native_swarm.command_worker import resolution_rpc; "
+        "signal.signal(signal.SIGTERM,lambda *_:sys.exit(0)); "
+        f"resolution_rpc(Path({str(claim)!r}),[sys.executable,'-c',{rpc!r}],timeout=10)"
+    )
+    env = {**os.environ, "PYTHONPATH": str(Path(native_swarm.__file__).parent.parent)}
+    proc = subprocess.Popen([sys.executable, "-c", daemon], env=env)
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        proc.terminate()
+        proc.wait(timeout=5)
+        assert read(claim / "operator-resolution-process.json")["quiesced"]
+        assert not worker.resolution_pending(run)
+        time.sleep(1.1)
+        assert not late.exists()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=3)
+
+
+def test_retry_retains_unsettled_resolution_and_completion_hold(tmp_path, monkeypatch):
+    state, run, claim = fixture(tmp_path)
+    monkeypatch.setattr("native_swarm.commands.subprocess.Popen", Mock(return_value=SimpleNamespace(pid=99999999)))
+    record = issue(state, [claim], "stop_now")[0]
+    atomic(claim / "operator-command.json", {**record, "state": "review_required"})
+    atomic(claim / "operator-release-intent.json", {"command": record["id"]})
+    atomic(claim / "operator-resolution-process.json", {"intent": True, "quiesced": False})
+    with pytest.raises(ValueError, match="not confirmed quiescent"):
+        retry(state, claim)
+    assert (claim / "operator-release-intent.json").exists()
+    with pytest.raises(RuntimeError, match="remains paused"):
+        worker.recover_completion(run)
