@@ -47,6 +47,11 @@ def test_real_template_generation_preserves_original_checker(tmp_path, group_siz
         "group_size": group_size,
     }
     configure(tmp_path, profile)
+    helper = (tmp_path / "prepare_assignment.py").read_text()
+    assert "acquire_args=[sys.executable," in helper
+    assert "['python3'" not in helper
+    assert "f'python3 " not in helper
+    assert "f'{sys.executable} " in helper
     for path in tmp_path.glob("*.py"):
         compile(path.read_text(), str(path), "exec")
     assert read(tmp_path / "run-config.json")["model"] == "gpt-6.1-terra"

@@ -365,6 +365,19 @@ class SwarmApp(App):
         )
         self.query_one("#summary", Static).update(
             f"{data['running']} workers running  ·  {data['open']} unresolved claims  ·  {data['verified']} verified  ·  {data['pending']} pending\nUsage: {display(used)}% used (observed {age} ago) / {policy['cutoff_used_percent']}% cutoff · {MODES.get(policy['mode'], 'invalid policy')} · API-equivalent cost ≥ ${cost:.2f}{tool_status}"
+            + (
+                "\nController: "
+                + (
+                    data["controllers"][-1]["stop"]
+                    or (
+                        "running / preparing assignments"
+                        if data["controllers"][-1]["alive"]
+                        else "stopped"
+                    )
+                )
+                if data.get("controllers")
+                else ""
+            )
         )
         app_update = read(self.backend.state / "application-update-status.json")
         self.query_one("#app-update-status", Static).update(

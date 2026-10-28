@@ -61,12 +61,24 @@ class Projection:
         return value
 
     def snapshot(self, runs: list[Path], quota_path: Path):
-        rows, blockers, improvements = [], [], []
+        rows, blockers, improvements, controllers = [], [], [], []
         verdicts = {}
         for run in runs:
             verdicts.update(self.load(run / "observed-verdicts.json"))
         for run in runs:
             journal = self.load(run / "rolling-executor/journal.json")
+            if self.load(run / "native-app-managed.json"):
+                owner = self.load(run / ".rolling-executor-owner.json")
+                stop_file = run / "STOP_NEW_CLAIMS"
+                controllers.append(
+                    {
+                        "run": run.name,
+                        "alive": process_alive(owner.get("pid"), run),
+                        "stop": stop_file.read_text().strip()
+                        if stop_file.exists()
+                        else "",
+                    }
+                )
             jobs = {
                 j.get("claim_id"): j
                 for j in journal.get("jobs", {}).values()
@@ -109,6 +121,24 @@ class Projection:
                     state = "result awaiting controller"
                 else:
                     state = "open claim / no worker"
+                expired = False
+                try:
+                    lease = dt.datetime.fromisoformat(
+                        (c.get("expires") or c.get("expires_at") or "").replace(
+                            "Z", "+00:00"
+                        )
+                    )
+                    expired = not alive and lease.timestamp() <= time.time()
+                except (ValueError, TypeError, OverflowError):
+                    pass
+                if expired and not submission and not released:
+                    state = (
+                        "expired lease / saved MATCH"
+                        if result.get("match")
+                        else "expired lease / saved result"
+                        if result
+                        else "expired lease"
+                    )
                 records = []
                 for record in sorted(
                     (claim / "work/recorded-checks").glob("check-*.json")
@@ -212,7 +242,7 @@ class Projection:
                     "bytes": c.get("size"),
                     "state": state,
                     "alive": alive,
-                    "closed": bool(submission or released),
+                    "closed": bool(submission or released or expired),
                     "best": best,
                     "checks": len(records),
                     "rounds": len(list((claim / "work/batch-rounds").glob("*.json"))),
@@ -244,6 +274,7 @@ class Projection:
                 improvements, key=lambda x: x.get("at") or "", reverse=True
             ),
             "quota": self.load(quota_path),
+            "controllers": controllers,
             "running": sum(r["agents"] for r in rows),
             "open": sum(not r["closed"] for r in rows),
             "verified": sum(r["state"] == "verified" for r in rows),
