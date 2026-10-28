@@ -51,7 +51,7 @@ def test_lease_does_not_imply_running_and_failed_checks_do_not_improve_best(tmp_
         and row["state"] == "open claim / no worker"
     )
     assert row["best"] == 7 and row["checks_since_best"] == 1
-    assert [x["to"] for x in row["best_history"]] == [15, 7]
+    assert [x["to"] for x in row["best_history"]] == [7]
 
 
 def test_local_match_pending_and_verified_are_different(tmp_path):

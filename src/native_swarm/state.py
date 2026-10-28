@@ -144,34 +144,24 @@ class Projection:
                     (claim / "work/recorded-checks").glob("check-*.json")
                 ):
                     value = self.load(record)
-                    if value:
-                        records.append(value)
-                best, best_check, best_time = None, None, None
-                history = []
-                for index, value in enumerate(records, 1):
-                    check = value.get("checker_result", {})
-                    score = (
-                        0
-                        if check.get("status") == "match"
-                        else check.get("ndiff_insn")
-                        if check.get("status") == "wip"
-                        else None
+                    records.append(value)
+                assignment = self.load(claim / "assignment.json")
+                from .budgets import effective_limits
+                from .progress import checked_progress
+
+                progress = checked_progress(claim, records, assignment)
+                best = progress["best"]
+                best_check, best_time = progress["best_check"], progress["best_time"]
+                history = [
+                    dict(
+                        event,
+                        claim_path=str(claim),
+                        claim_id=claim.name,
+                        address=c.get("address"),
                     )
-                    if type(score) is int and (best is None or score < best):
-                        previous = best
-                        best, best_check = score, index
-                        best_time = value.get("finished_at") or value.get("started_at")
-                        event = {
-                            "claim_path": str(claim),
-                            "claim_id": claim.name,
-                            "address": c.get("address"),
-                            "at": best_time,
-                            "check": index,
-                            "from": previous,
-                            "to": score,
-                        }
-                        history.append(event)
-                        improvements.append(event)
+                    for event in progress["events"]
+                ]
+                improvements.extend(history)
                 elapsed = None
                 if best_time:
                     try:
@@ -208,7 +198,6 @@ class Projection:
                                 "evidence_path": str(claim),
                             }
                         )
-                assignment = self.load(claim / "assignment.json")
                 group = self.load(claim / "collaboration/group.json")
                 members = group.get("members", [])
                 agents = (
@@ -246,7 +235,7 @@ class Projection:
                     "best": best,
                     "checks": len(records),
                     "rounds": len(list((claim / "work/batch-rounds").glob("*.json"))),
-                    "limit": assignment.get("max_batch_rounds", 20),
+                    "limit": effective_limits(claim, assignment)["max_batch_rounds"],
                     "checks_since_best": len(records) - best_check
                     if best_check
                     else None,

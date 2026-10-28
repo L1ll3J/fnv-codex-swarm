@@ -294,6 +294,7 @@ class SwarmApp(App):
             "Queue first",
             "Rounds",
             "Budget",
+            "Rolling window",
         )
         self.query_one("#queue", DataTable).add_columns(
             "Function", "Bytes", "Historical diff", "Profile", "State"
@@ -513,6 +514,9 @@ class SwarmApp(App):
                         "yes" if p["queue_first"] else "no",
                         str(p.get("rounds", 20)),
                         p.get("budget_mode", "shared"),
+                        str(p.get("improvement_window", 3)) + " rounds"
+                        if p.get("extend_while_improving", True)
+                        else "off",
                     ],
                 )
                 for p in self.profile_drafts

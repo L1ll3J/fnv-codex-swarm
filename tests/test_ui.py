@@ -1,4 +1,4 @@
-from textual.widgets import Button
+from textual.widgets import Button, Checkbox
 import asyncio
 from unittest.mock import Mock
 from native_swarm.app import SwarmApp
@@ -243,6 +243,11 @@ def test_profile_brackets_and_usage_drafts_survive_refresh(tmp_path):
             await pilot.pause()
             app.push_screen(ProfileEditor(backend.profiles()[0]), app.save_profile)
             await pilot.pause()
+            assert app.screen.query_one("#profile-extend", Checkbox).value is True
+            app.screen.query_one("#profile-extend", Checkbox).value = False
+            app.screen.query_one("#profile-window", Input).value = "5"
+            await app.refresh_data()
+            assert app.screen.query_one("#profile-window", Input).value == "5"
             bands = app.screen.query_one("#profile-bands", SelectionList)
             bands.deselect_all()
             bands.select("256-511")
@@ -253,6 +258,8 @@ def test_profile_brackets_and_usage_drafts_survive_refresh(tmp_path):
             await pilot.press("enter")
             await pilot.pause()
             assert backend.profiles()[0]["bands"] == ["256-511", "1K-4K"]
+            assert backend.profiles()[0]["extend_while_improving"] is False
+            assert backend.profiles()[0]["improvement_window"] == 5
             app.query_one(TabbedContent).active = "settings-tab"
             app.query_one("#usage-cutoff", Input).value = "75"
             app.query_one("#usage-taper", Input).value = "50"
