@@ -8,6 +8,21 @@ def _local(pattern):
     return pattern.replace("$FNV_ROOT", str(Path.home() / "fnvdecomp"))
 
 
+def configure_submission_audit(root):
+    """Use the submission gate's parser without weakening the integrity audit."""
+    path = Path(root) / "audit.py"
+    text = path.read_text()
+    old = "m['actual_exit_code']!=0 or 'MATCH' not in log.splitlines()"
+    if text.count(old) != 1:
+        raise ValueError("Unsupported submission audit; stop retained for review.")
+    text = "from native_swarm.checker_result import accepted_match\n" + text.replace(
+        old,
+        "not accepted_match(m['actual_exit_code'],log,json.loads((p/'pack/pack.json').read_text()))[0]",
+    )
+    ast.parse(text, filename=str(path))
+    path.write_text(text)
+
+
 def configure(root):
     from .runtime import replace_once
 
@@ -174,5 +189,7 @@ def configure(root):
         "version_files += [tool_context['directory']/n for n in a['official_tools']['manifest']['files']] if tool_context else []\nfrom native_swarm.toolchains import files as compiler_files\nversion_files += [pathlib.Path(p) for p in compiler_files(tool_context.get('toolchains',{}))] if tool_context else []\nversions={str(q):digest(q) for q in version_files}",
     )
     validator.write_text(text)
+    if (root / "audit.py").exists():
+        configure_submission_audit(root)
     for path in root.glob("*.py"):
         ast.parse(path.read_text(), filename=str(path))
