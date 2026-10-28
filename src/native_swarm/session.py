@@ -345,10 +345,6 @@ def _run(root, claim_id, prompt, recover=False):
                 atomic(directory / "state.json", state)
             if capacity and consistent_thread:
                 retries = state.get("capacity_retries", 0)
-                if retries >= 5:
-                    raise RuntimeError(
-                        "Provider capacity retry limit reached; same session preserved"
-                    )
                 if stop.is_set() or incomplete_dispatch(claim):
                     raise RuntimeError(
                         "Uncertain or stopped dispatch retained; no capacity retry"
@@ -358,6 +354,10 @@ def _run(root, claim_id, prompt, recover=False):
                     for path in (claim / "work/recorded-checks").glob("check-*.json")
                 ) or not remaining(claim, assignment):
                     break
+                if retries >= 5:
+                    raise RuntimeError(
+                        "Provider capacity retry limit reached; same session preserved"
+                    )
                 archive_results(claim, directory / f"capacity-{turn['number']:03d}")
                 delay = min(60, 15 * (2**retries), max(0, deadline - time.time()))
                 state.update(

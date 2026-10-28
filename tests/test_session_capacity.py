@@ -36,8 +36,9 @@ def events(capacity=True):
     ]
 
 
+@pytest.mark.parametrize("failures,last_error", [(1, False), (5, True)])
 def test_real_supervisor_resumes_actual_thread_after_toolwork_and_capacity(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, failures, last_error
 ):
     claim = tmp_path / "claims/claim"
     claim.mkdir(parents=True)
@@ -72,30 +73,30 @@ def test_real_supervisor_resumes_actual_thread_after_toolwork_and_capacity(
         number = len(calls)
         rows = (
             events()
-            if number == 1
+            if number <= failures or last_error
             else [
                 {"type": "thread.started", "thread_id": "actual-thread"},
                 {"type": "turn.completed"},
             ]
         )
         receipt = {
-            "checker_exit_code": 1 if number == 1 else 0,
+            "checker_exit_code": 1 if number <= failures else 0,
             "checker_result": {"status": "wip", "ndiff_insn": 3}
-            if number == 1
+            if number <= failures
             else {"status": "match"},
         }
         path = claim / f"work/recorded-checks/check-{number:03d}.json"
-        code = f"import json,pathlib,sys;sys.stdin.read();p=pathlib.Path({str(path)!r});p.parent.mkdir(parents=True,exist_ok=True);p.write_text({json.dumps(receipt)!r});[print(json.dumps(row),flush=True) for row in {rows!r}];sys.exit({1 if number == 1 else 0})"
+        code = f"import json,pathlib,sys;sys.stdin.read();p=pathlib.Path({str(path)!r});p.parent.mkdir(parents=True,exist_ok=True);p.write_text({json.dumps(receipt)!r});[print(json.dumps(row),flush=True) for row in {rows!r}];sys.exit({1 if number <= failures or last_error else 0})"
         return [sys.executable, "-c", code]
 
     monkeypatch.setattr(session, "command", command)
     assert session.run(tmp_path, "claim", b"initial prompt") == 0
-    assert calls == [None, "actual-thread"]
+    assert calls == [None] + ["actual-thread"] * failures
     assert 15 in delays
     state = read(claim / "session/state.json")
-    assert state["state"] == "complete" and state["capacity_retries"] == 1
-    assert len(state["turns"]) == 2
-    assert len(list((claim / "work/recorded-checks").glob("*.json"))) == 2
+    assert state["state"] == "complete" and state["capacity_retries"] == failures
+    assert len(state["turns"]) == failures + 1
+    assert len(list((claim / "work/recorded-checks").glob("*.json"))) == failures + 1
 
 
 def saved_failure(tmp_path):
