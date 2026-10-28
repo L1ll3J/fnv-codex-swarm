@@ -402,3 +402,82 @@ def test_exhausted_member_cannot_reserve_another_members_candidate(tmp_path):
         check(member, "new", [source])
     board = Board(claim / "collaboration/board.sqlite3")
     assert board.reserve("peer-2", digest(source))
+
+
+def stopped_group_fixture(tmp_path):
+    from native_swarm.commands import operator_terminal
+
+    claim, member, _ = fixture(tmp_path)
+    prompt = member.parent / "cli-prompt.txt"
+    prompt.write_text("immutable launched prompt")
+    record = claim / "work/recorded-checks/check-001.json"
+    atomic(record, {"fixture": True})
+    atomic(member.parent / "thread.json", {"thread_id": "real-thread"})
+    atomic(
+        claim / "collaboration/group.json",
+        {
+            "state": "running",
+            "streams_closed": False,
+            "ordinary_failure": True,
+            "model": "gpt-6.1-sol",
+            "canonical_assignment_sha256": digest(claim / "assignment.json"),
+            "members": [
+                {
+                    "workspace": str(member.parent),
+                    "exit_code": None,
+                    "prompt_sha256": digest(prompt),
+                    "assignment_sha256": digest(member),
+                }
+            ],
+        },
+    )
+    Board(claim / "collaboration/board.sqlite3").post(
+        "peer-1", "result", {"batch": {"results": [{"manifest": str(record)}]}}
+    )
+    atomic(
+        tmp_path / "usage-current.json",
+        {
+            "threads": [
+                {
+                    "id": "real-thread",
+                    "model": "gpt-6.1-sol",
+                    "usage": {"total_tokens": 10},
+                }
+            ]
+        },
+    )
+    atomic(
+        claim / "operator-stop-terminal.json",
+        {
+            "verified_stopped": True,
+            "assignment_sha256": digest(claim / "assignment.json"),
+            "pids": [],
+        },
+    )
+    assert operator_terminal(claim)
+    return claim, member, prompt, record
+
+
+def test_verified_operator_stop_retains_group_integrity_audit(tmp_path):
+    claim, _, _, _ = stopped_group_fixture(tmp_path)
+    with pytest.raises(ValueError, match="safely sealed"):
+        audit_group(claim)
+    assert audit_group(claim, allow_operator_stop=True)
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    ["prompt", "member_assignment", "canonical_assignment", "receipt_provenance"],
+)
+def test_operator_match_cannot_bypass_group_integrity(tmp_path, artifact):
+    claim, member, prompt, record = stopped_group_fixture(tmp_path)
+    if artifact == "prompt":
+        prompt.write_text("changed prompt")
+    elif artifact == "member_assignment":
+        atomic(member, {"changed": True})
+    elif artifact == "canonical_assignment":
+        atomic(claim / "assignment.json", {"changed": True})
+    else:
+        atomic(record.with_name("check-002.json"), {"unattributed": True})
+    with pytest.raises(ValueError):
+        audit_group(claim, allow_operator_stop=True)

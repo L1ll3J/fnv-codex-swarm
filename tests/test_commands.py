@@ -735,3 +735,67 @@ def test_ambiguous_handoff_launch_keeps_capacity_until_observed(tmp_path):
         worker.stop_tree(claim)
     assert occupied(read(state / "config.json"), state) == 1
     assert not read(claim / "operator-stop-terminal.json")
+
+
+def test_new_handoff_rejection_latches_permission_stop(tmp_path, monkeypatch):
+    import json
+
+    state, run, claim = fixture(tmp_path)
+    atomic(
+        claim / "session/state.json", {"thread_id": "existing", "streams_closed": True}
+    )
+    (claim / "work").mkdir()
+    monkeypatch.setattr("native_swarm.commands.operator_terminal", lambda _: True)
+    monkeypatch.setattr(
+        "native_swarm.session.command",
+        lambda *a: ["codex", "exec", "-C", str(run), "resume", "existing", "-"],
+    )
+
+    class Proc:
+        pid = 99999999
+        returncode = 1
+
+        def communicate(self, value, timeout):
+            pass
+
+        def poll(self):
+            return 1
+
+    def launch(argv, **kwargs):
+        kwargs["stdout"].write(
+            (json.dumps({"type": "error", "code": "approval_denied"}) + "\n").encode()
+        )
+        return Proc()
+
+    monkeypatch.setattr(worker.subprocess, "Popen", launch)
+    with pytest.raises(PermissionError, match="permission rejection"):
+        worker.authored_handoff(claim, 15)
+    assert read(run / "approval-blocker-current.json")["source"] == "operator-handoff"
+    assert (run / "STOP_NEW_CLAIMS").exists()
+    assert not operator_retiring(run)
+    assert (
+        read(claim / "operator-authored-handoff.json")["status"] == "blocked_permission"
+    )
+
+
+def test_rejected_handoff_does_not_release_or_resume_admissions(tmp_path, monkeypatch):
+    state, _, claim = fixture(tmp_path)
+    monkeypatch.setattr(
+        "native_swarm.commands.subprocess.Popen",
+        Mock(return_value=SimpleNamespace(pid=99999999)),
+    )
+    record = issue(state, [claim], "handoff", replace=True, handoff="always")[0]
+    monkeypatch.setattr(worker, "stop_tree", Mock())
+    monkeypatch.setattr(
+        worker,
+        "authored_handoff",
+        Mock(side_effect=PermissionError("permission rejection")),
+    )
+    release = Mock()
+    start = Mock()
+    monkeypatch.setattr(worker, "release", release)
+    monkeypatch.setattr(Backend, "start", start)
+    worker.execute(state, record["id"])
+    assert read(claim / "operator-command.json")["state"] == "review_required"
+    release.assert_not_called()
+    start.assert_not_called()

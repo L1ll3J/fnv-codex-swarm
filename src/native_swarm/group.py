@@ -628,18 +628,24 @@ def run(root, claim_id):
     return result.returncode
 
 
-def audit_group(claim):
+def audit_group(claim, *, allow_operator_stop=False):
     """Additional provenance gate; the original evidence audit still follows."""
     claim = Path(claim)
     directory = claim / "collaboration"
     if not directory.exists():
         return True
     state = read(directory / "group.json")
+    from .commands import operator_terminal
+
+    stopped = allow_operator_stop and operator_terminal(claim)
     if (
         state.get("state") != "sealed"
+        and not stopped
         or group_rejected(claim)
         or state.get("ordinary_failure")
+        and not stopped
         or not state.get("streams_closed")
+        and not stopped
     ):
         raise ValueError("Group is not safely sealed.")
     if digest(claim / "assignment.json") != state["canonical_assignment_sha256"]:
@@ -689,7 +695,9 @@ def audit_group(claim):
         if (
             not workspace.resolve().is_relative_to(directory.resolve())
             or member.get("exit_code") is None
+            and not stopped
             or ordinary_peer_failure(member)
+            and not stopped
             or process_alive(member.get("pid"), claim.parent.parent)
         ):
             raise ValueError(
@@ -700,7 +708,10 @@ def audit_group(claim):
             or digest(workspace / "assignment.json") != member["assignment_sha256"]
         ):
             raise ValueError("Group prompt or assignment changed.")
-        observed = usage.get(member.get("thread_id"))
+        thread_id = member.get("thread_id")
+        if stopped and not thread_id:
+            thread_id = read(workspace / "thread.json").get("thread_id")
+        observed = usage.get(thread_id)
         if not observed or observed.get("usage") is None:
             return False
         if observed.get("model") != state["model"]:

@@ -284,9 +284,6 @@ def test_resume_keeps_protected_stop_and_reports_actual_reason(tmp_path, monkeyp
 def test_resume_replaces_operator_drained_generation_without_clearing_drain(
     tmp_path, monkeypatch
 ):
-    import pytest
-    from native_swarm.backend import ControlError
-
     b, sol, _, _ = resume_fixture(tmp_path, monkeypatch)
     atomic(sol / "operator-drain.json", {"reason": "Finish the current run"})
     create = Mock()
@@ -466,3 +463,34 @@ def test_dispatch_rechecks_paused_and_idled_targets(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match=WITHDRAWN):
         claim_request(sol, dispatch)
     dispatch.assert_not_called()
+
+
+def test_new_generation_subtracts_surviving_profile_tasks_before_refill(
+    tmp_path, monkeypatch
+):
+    b, old, _, _ = fixture(tmp_path, monkeypatch)
+    cfg = b.config
+    cfg["profiles"] = [{**cfg["profiles"][0], "instances": 10}] + [
+        {**p, "instances": 0} for p in cfg["profiles"][1:]
+    ]
+    new = tmp_path / "replacement"
+    atomic(new / "native-app-profile.json", cfg["profiles"][0])
+    atomic(new / "native-app-managed.json", {"state_dir": str(b.state)})
+    atomic(new / "native-app-quota.json", {"path": str(b.state / "allowance")})
+    atomic(new / ".rolling-executor-owner.json", {"pid": 4})
+    cfg["managed_runs"].append(str(new))
+    atomic(b.state / "config.json", cfg)
+    live = {1, 2, 3, 4}
+    monkeypatch.setattr(
+        "native_swarm.policy.process_alive", lambda pid, root: pid in live
+    )
+    for n in range(9):
+        atomic(old / f"claims/old-{n}/claim.json", {"claim_id": f"old-{n}"})
+    atomic(b.state / "idle-slots.json", {"default": 1})
+    assert (
+        decision(new)["target"] == 0
+    )  # Nine survivors already fill the nine remaining slots.
+    atomic(old / "claims/old-0/giveup-response.json", {"released": True})
+    assert decision(new)["target"] == 1
+    atomic(b.state / "idle-slots.json", {})
+    assert decision(new)["target"] == 2

@@ -98,6 +98,37 @@ def targets(profiles, fraction):
     return out
 
 
+def foreign_functions(cfg, root, identifier):
+    """Surviving work in older generations consumes this profile's allocation."""
+    from .assessment import claim_reserved
+    from .commands import handoff_reserved
+
+    held = set()
+    for value in cfg.get("managed_runs", []):
+        run = Path(value)
+        if run == root or read(run / "native-app-profile.json").get("id") != identifier:
+            continue
+        jobs = {
+            j.get("claim_id"): j
+            for j in read(run / "rolling-executor/journal.json")
+            .get("jobs", {})
+            .values()
+        }
+        for path in (run / "claims").glob("*/claim.json"):
+            claim = path.parent
+            closed = read(claim / "giveup-response.json") or read(
+                claim / "submission-response.json"
+            )
+            if (
+                not closed
+                or process_alive(jobs.get(claim.name, {}).get("pid"), run)
+                or claim_reserved(claim, run)
+                or handoff_reserved(claim)
+            ):
+                held.add(claim.name)
+    return len(held)
+
+
 def decision(root, now=None):
     root = Path(root)
     state = Path(read(root / "native-app-managed.json")["state_dir"])
@@ -129,7 +160,13 @@ def decision(root, now=None):
             allocation[identifier] = 0
     owner = owners.get(profile["id"])
     result["target"] = (
-        allocation.get(profile["id"], 0) if owner and owner[0] == root else 0
+        max(
+            0,
+            allocation.get(profile["id"], 0)
+            - foreign_functions(cfg, root, profile["id"]),
+        )
+        if owner and owner[0] == root
+        else 0
     )
     return result
 

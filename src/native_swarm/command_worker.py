@@ -318,7 +318,7 @@ def completion_window(run):
 def authored_handoff(claim, timeout):
     """Resume an existing context once; checking stays closed by the operator command."""
     from .session import command
-    from .group import group_rejected
+    from .group import group_rejected, rejection_event, member_rejection
     from .commands import operator_terminal
     from .assessment import occupied
 
@@ -364,6 +364,8 @@ def authored_handoff(claim, timeout):
         (claim / "operator-authored-handoff.jsonl").open("ab") as out,
         (claim / "operator-authored-handoff.stderr").open("ab") as err,
     ):
+        out.seek(0, 2)
+        log_offset = out.tell()
         state = Path(read(run / "native-app-managed.json")["state_dir"])
         with locked(state / "capacity.lock"):
             cfg = read(state / "config.json")
@@ -431,6 +433,43 @@ def authored_handoff(claim, timeout):
                     "finished": True,
                     "exit_code": proc.returncode,
                 },
+            )
+        out.flush()
+        with (claim / "operator-authored-handoff.jsonl").open("rb") as source:
+            source.seek(log_offset)
+            events = []
+            for line in source:
+                try:
+                    events.append(json.loads(line))
+                except ValueError:
+                    continue
+        if any(rejection_event(e) for e in events) or member_rejection(workspace):
+            evidence = {
+                "claim_id": claim.name,
+                "source": "operator-handoff",
+                "report_path": str(claim / "operator-authored-handoff.jsonl"),
+                "at": time.time(),
+            }
+            atomic(claim / "operator-handoff-rejection.json", evidence)
+            if not (run / "approval-blocker-current.json").exists():
+                atomic(run / "approval-blocker-current.json", evidence)
+            try:
+                with (run / "STOP_NEW_CLAIMS").open("x") as stop:
+                    stop.write(
+                        "Approval rejection during operator handoff; operator review required."
+                    )
+            except FileExistsError:
+                pass
+            atomic(
+                claim / "operator-authored-handoff.json",
+                {
+                    "status": "blocked_permission",
+                    "thread_id": thread,
+                    "exit_code": proc.returncode,
+                },
+            )
+            raise PermissionError(
+                "Handoff reported a permission rejection; evidence and claim retained, admissions not resumed."
             )
         atomic(
             claim / "operator-authored-handoff.json",
@@ -526,7 +565,7 @@ def submit_match(claim, record, best):
         [
             sys.executable,
             "-c",
-            "from evidence import audit_worker; import json,pathlib,sys; p=pathlib.Path(sys.argv[1]); audit_worker(p,json.loads(pathlib.Path(sys.argv[2]).read_text()))",
+            "from evidence import audit_worker; from native_swarm.group import audit_group; import json,pathlib,sys; p=pathlib.Path(sys.argv[1]); assert not (p/'collaboration').exists() or audit_group(p,allow_operator_stop=True), 'Group integrity/attribution audit incomplete'; audit_worker(p,json.loads(pathlib.Path(sys.argv[2]).read_text()))",
             str(claim),
             str(output),
         ],

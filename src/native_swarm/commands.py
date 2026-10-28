@@ -234,6 +234,8 @@ def handoff_reserved(claim):
 def operator_retiring(run):
     """Recognize only operator-originated retirement, never another saved failure."""
     run = Path(run)
+    if (run / "approval-blocker-current.json").exists():
+        return False
     stop = (
         (run / "STOP_NEW_CLAIMS").read_text().strip()
         if (run / "STOP_NEW_CLAIMS").exists()
