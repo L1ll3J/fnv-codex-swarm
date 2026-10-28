@@ -244,7 +244,8 @@ class Projection:
                     "lease": c.get("expires") or c.get("expires_at"),
                     "error": "peer failed; checked work retained for review"
                     if group.get("ordinary_failure")
-                    else job.get("state")
+                    else self.load(claim / "session/state.json").get("error")
+                    or job.get("state")
                     if "review" in str(job.get("state"))
                     else "",
                     "residual": result.get("residual_issue", ""),

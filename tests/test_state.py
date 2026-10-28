@@ -105,3 +105,30 @@ def test_preparation_failure_is_visible_even_before_any_claim(tmp_path):
     s = Projection().snapshot([r], tmp_path / "q")
     assert not s["rows"]
     assert s["controllers"][0]["stop"] == "assignment preparation failed"
+
+
+def test_review_row_explains_actual_supervisor_failure(tmp_path):
+    r, p = fixture(tmp_path)
+    atomic(
+        r / "rolling-executor/journal.json",
+        {
+            "jobs": {
+                "w": {
+                    "worker": "w",
+                    "claim_id": "c",
+                    "state": "failed_review_required",
+                    "pid": 99999999,
+                }
+            },
+        },
+    )
+    atomic(
+        p / "session/state.json",
+        {
+            "state": "review_required",
+            "streams_closed": True,
+            "error": "Provider capacity retries exhausted; evidence preserved",
+        },
+    )
+    row = Projection().snapshot([r], tmp_path / "q")["rows"][0]
+    assert row["error"] == "Provider capacity retries exhausted; evidence preserved"
