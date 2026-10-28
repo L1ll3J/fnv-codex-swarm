@@ -365,7 +365,7 @@ class Backend:
                         if idle_reason(run):
                             from .handover_watch import request
 
-                            request(run, self.state)
+                            request(run, self.state, control_locked=True)
                             represented.add(running["id"])
                             pending.append(run)
                             continue

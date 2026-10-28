@@ -140,3 +140,58 @@ def test_other_controller_protected_stop_blocks_replacement(tmp_path, monkeypatc
     assert advance(root, backend) is True
     assert read(root / "operator-profile-handover-pending.json")["state"] == "blocked"
     backend.create_run.assert_not_called()
+
+
+@pytest.mark.parametrize("protected", ["replacement_start_intent", "review_required"])
+def test_concurrent_request_cannot_overwrite_controller_launch_state(
+    tmp_path, monkeypatch, protected
+):
+    import threading
+    from native_swarm.handover_watch import request
+
+    backend, root, _ = fixture(tmp_path, monkeypatch)
+    marker = root / "operator-profile-handover-pending.json"
+    attempted = threading.Event()
+    finished = threading.Event()
+    spawn = Mock()
+    monkeypatch.setattr("native_swarm.handover_watch.subprocess.Popen", spawn)
+    errors, outcomes = [], []
+
+    def publish_request():
+        attempted.set()
+        try:
+            outcomes.append(request(root, backend.state))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    # advance() owns this exact lock throughout retirement/start and publication
+    # of the final outcome. A simultaneous save must observe the final state.
+    with backend.locked():
+        thread = threading.Thread(target=publish_request)
+        thread.start()
+        assert attempted.wait(2)
+        assert not finished.wait(0.1)
+        atomic(marker, {"state": "replacement_start_intent"})
+        atomic(marker, {"state": protected})
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert not errors
+    assert outcomes == [False]
+    assert read(marker)["state"] == protected
+    spawn.assert_not_called()
+
+
+def test_request_with_existing_control_lock_does_not_reacquire_it(
+    tmp_path, monkeypatch
+):
+    from native_swarm.handover_watch import request
+
+    backend, root, _ = fixture(tmp_path, monkeypatch)
+    spawn = Mock()
+    monkeypatch.setattr("native_swarm.handover_watch.subprocess.Popen", spawn)
+    with backend.locked():
+        request(root, backend.state, control_locked=True)
+    spawn.assert_called_once()
+    assert read(root / "operator-profile-handover-pending.json")["state"] == "pending"

@@ -12,8 +12,14 @@ from .profiles import validate_profiles
 from .state import atomic, process_alive, read
 
 
-def request(root, state):
+def request(root, state, *, control_locked=False):
     root, state = Path(root), Path(state)
+    if not control_locked:
+        # Use the same lock as advance() and Backend.start(). Checking a marker
+        # before taking this lock could overwrite an ambiguous launch outcome.
+        with (state / "control.lock").open("a") as guard:
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            return request(root, state, control_locked=True)
     marker = root / "operator-profile-handover-pending.json"
     if read(marker).get("state") in ("replacement_start_intent", "review_required"):
         return False
