@@ -99,3 +99,27 @@ def test_missing_journal_is_not_assumed_idle(tmp_path, monkeypatch):
     _, root, _ = setup_idle(tmp_path, monkeypatch)
     (root / "rolling-executor/journal.json").unlink()
     assert "journal" in idle_reason(root)
+
+
+@pytest.mark.parametrize("wrong", ["script", "owner"])
+def test_stable_process_handle_does_not_signal_changed_identity(tmp_path, monkeypatch, wrong):
+    from pathlib import Path
+    from native_swarm.handover import terminate_controller
+
+    root = tmp_path / "run"
+    owner = {"pid": 123, "generation": "original"}
+    atomic(root / ".rolling-executor-owner.json", owner)
+    if wrong == "owner":
+        atomic(root / ".rolling-executor-owner.json", {**owner, "generation": "replacement"})
+    script = "worker.py" if wrong == "script" else "app_controller.py"
+    original = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes", lambda path: b"python\0-u\0" + str(root / script).encode() + b"\0" if str(path) == "/proc/123/cmdline" else original(path))
+    monkeypatch.setattr("native_swarm.handover.os.pidfd_open", lambda pid: 456)
+    close = Mock()
+    send = Mock()
+    monkeypatch.setattr("native_swarm.handover.os.close", close)
+    monkeypatch.setattr("native_swarm.handover.signal.pidfd_send_signal", send)
+    with pytest.raises(RuntimeError, match="identity changed"):
+        terminate_controller(123, root, owner)
+    send.assert_not_called()
+    close.assert_called_once_with(456)
