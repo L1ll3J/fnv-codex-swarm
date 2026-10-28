@@ -206,3 +206,31 @@ def test_real_durable_batch_driver_extends_then_stops_without_improvement(tmp_pa
     with pytest.raises(AssertionError, match="budget exhausted"):
         run_batch(assignment, "round-5", [source], invoke=invoke)
     assert len(calls) == 4
+
+
+def test_independent_per_member_profile_has_same_rolling_allowance(tmp_path):
+
+    shared = allocation({"rounds": 2, "group_size": 1, "budget_mode": "shared"})
+    independent = allocation(
+        {"rounds": 2, "group_size": 1, "budget_mode": "per_member"}
+    )
+    assert independent == shared
+    atomic(tmp_path / "assignment.json", independent)
+    for number, score in ((1, 10), (2, 9)):
+        manifest = tmp_path / f"work/recorded-checks/check-{number:03d}.json"
+        atomic(
+            manifest,
+            {
+                "checker_result": {"status": "wip", "ndiff_insn": score},
+                "checker_exit_code": 1,
+            },
+        )
+        atomic(
+            tmp_path / f"work/batch-rounds/round-{number}.json",
+            {
+                "round_number": number,
+                "batch_id": f"round-{number}",
+                "results": [{"manifest": str(manifest)}],
+            },
+        )
+    assert effective_limits(tmp_path)["max_batch_rounds"] == 5

@@ -12,6 +12,8 @@ def allocation(profile):
     rounds, mode = profile.get("rounds", 20), profile.get("budget_mode", "shared")
     validate(rounds, mode)
     size = profile.get("group_size", 1)
+    if size == 1:
+        mode = "shared"
     total = rounds * size if mode == "per_member" else rounds
     return {
         "max_batch_rounds": total,
