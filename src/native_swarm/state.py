@@ -73,6 +73,9 @@ class Projection:
                 controllers.append(
                     {
                         "run": run.name,
+                        "handover": self.load(
+                            run / "operator-profile-handover-pending.json"
+                        ),
                         "alive": process_alive(owner.get("pid"), run),
                         "stop": stop_file.read_text().strip()
                         if stop_file.exists()

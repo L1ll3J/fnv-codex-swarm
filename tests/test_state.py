@@ -132,3 +132,18 @@ def test_review_row_explains_actual_supervisor_failure(tmp_path):
     )
     row = Projection().snapshot([r], tmp_path / "q")["rows"][0]
     assert row["error"] == "Provider capacity retries exhausted; evidence preserved"
+
+
+def test_blocked_profile_handover_reason_is_projected(tmp_path):
+    r = tmp_path / "run"
+    atomic(r / "native-app-managed.json", {"state_dir": str(tmp_path)})
+    atomic(
+        r / "operator-profile-handover-pending.json",
+        {
+            "state": "blocked",
+            "reason": "Drain safely, then Start / Resume",
+        },
+    )
+    value = Projection().snapshot([r], tmp_path / "q")["controllers"][0]
+    assert value["handover"]["state"] == "blocked"
+    assert value["handover"]["reason"] == "Drain safely, then Start / Resume"

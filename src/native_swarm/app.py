@@ -364,12 +364,23 @@ class SwarmApp(App):
             if tools
             else ""
         )
+        handover_block = next(
+            (
+                controller["handover"].get("reason", "Profile handover requires review")
+                for controller in reversed(data.get("controllers", []))
+                if controller.get("alive")
+                and controller.get("handover", {}).get("state")
+                in ("blocked", "review_required")
+            ),
+            None,
+        )
         self.query_one("#summary", Static).update(
             f"{data['running']} workers running  ·  {data['open']} unresolved claims  ·  {data['verified']} verified  ·  {data['pending']} pending\nUsage: {display(used)}% used (observed {age} ago) / {policy['cutoff_used_percent']}% cutoff · {MODES.get(policy['mode'], 'invalid policy')} · API-equivalent cost ≥ ${cost:.2f}{tool_status}"
             + (
                 "\nController: "
                 + (
-                    data["controllers"][-1]["stop"]
+                    handover_block
+                    or data["controllers"][-1]["stop"]
                     or (
                         "running / preparing assignments"
                         if data["controllers"][-1]["alive"]
