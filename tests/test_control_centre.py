@@ -163,6 +163,10 @@ def test_approved_generalist_text_is_scoped_to_groups():
     assert "allocated per member; all members use one controller-owned lease" in group
 
 
+@pytest.mark.skipif(
+    not (Path.home() / "fnvdecomp/work/swarm-native-random-v2-20261026").exists(),
+    reason="Local native template is not installed",
+)
 def test_runtime_configuration_binds_actual_model_and_effort(tmp_path):
     # Use the pinned template sites, without running native code or services.
     import shutil

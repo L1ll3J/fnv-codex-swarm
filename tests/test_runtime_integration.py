@@ -261,6 +261,9 @@ def test_actual_managed_inheritance_honors_cutoff_above_fifty(
             sys.modules.pop(name, None)
 
 
+@pytest.mark.skipif(
+    not TEMPLATE.exists(), reason="Local native template is not installed"
+)
 def test_intermediate_results_are_held_before_ingestion_and_resolver_reads(
     tmp_path, monkeypatch
 ):
@@ -325,6 +328,9 @@ def test_intermediate_results_are_held_before_ingestion_and_resolver_reads(
     assert scope["once"]() == []
 
 
+@pytest.mark.skipif(
+    not TEMPLATE.exists(), reason="Local native template is not installed"
+)
 def test_new_recorder_never_reports_a_repaired_rejection_as_free(tmp_path):
     import ast
     from native_swarm.tool_runtime import configure as configure_tools

@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 import shutil
+import pytest
 
 from native_swarm.duplicates import duplicate_result
 from native_swarm.group_check import digest, module
@@ -12,6 +13,9 @@ from native_swarm.state import atomic
 TEMPLATE = Path(str(Path.home() / "fnvdecomp/work/swarm-native-random-v2-20261026"))
 
 
+@pytest.mark.skipif(
+    not TEMPLATE.exists(), reason="Local native template is not installed"
+)
 def test_historical_duplicate_then_new_candidate_does_not_invent_a_receipt(tmp_path):
     for name in (
         "run-config.json",
