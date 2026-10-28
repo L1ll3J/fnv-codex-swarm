@@ -154,6 +154,27 @@ def stop_tree(claim, grace=10):
             },
         )
 
+    streams = [(claim / "work/codex.stdout.jsonl", 0)]
+    streams.extend((path, 0) for path in (claim / "session").glob("turn-*.jsonl"))
+    streams.extend(
+        (path, 0) for path in (claim / "collaboration").glob("peer-*/stdout.jsonl")
+    )
+    workspaces = [claim / "work"] + [
+        path for path in (claim / "collaboration").glob("peer-*") if path.is_dir()
+    ]
+    rejected = latch_permission_rejection(claim, streams, workspaces, "operator-stop")
+    if handoff.get("workspace"):
+        rejected = (
+            latch_handoff_rejection(
+                claim, Path(handoff["workspace"]), handoff.get("log_offset", 0)
+            )
+            or rejected
+        )
+    if rejected:
+        raise PermissionError(
+            "Retained permission rejection; mechanical evidence preserved and admissions remain stopped."
+        )
+
 
 def is_match(best):
     return bool(
@@ -315,16 +336,72 @@ def completion_window(run):
                 restore_completion(run)
 
 
+def latch_permission_rejection(claim, streams, workspaces, source):
+    """Preserve structured permission failures from any stopped model stream."""
+    from .group import rejection_event, member_rejection
+
+    rejected = any(member_rejection(workspace) for workspace in workspaces)
+    reference = None
+    for log, offset in streams:
+        if not log.exists():
+            continue
+        if not log.resolve().is_relative_to(claim.resolve()):
+            raise RuntimeError(
+                "Permission evidence stream escaped the claim; retained for review."
+            )
+        with log.open("rb") as output:
+            output.seek(offset)
+            for line in output:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(event, dict) and rejection_event(event):
+                    rejected, reference = True, str(log)
+                    break
+        if reference:
+            break
+    if not rejected:
+        return False
+    run = claim.parent.parent
+    evidence = {
+        "claim_id": claim.name,
+        "source": source,
+        "report_path": reference,
+        "at": time.time(),
+    }
+    atomic(claim / (source + "-rejection.json"), evidence)
+    if not (run / "approval-blocker-current.json").exists():
+        atomic(run / "approval-blocker-current.json", evidence)
+    try:
+        with (run / "STOP_NEW_CLAIMS").open("x") as stop:
+            stop.write(
+                "Approval rejection during " + source + "; operator review required."
+            )
+    except FileExistsError:
+        pass
+    return True
+
+
+def latch_handoff_rejection(claim, workspace, offset=0):
+    return latch_permission_rejection(
+        claim,
+        [(claim / "operator-authored-handoff.jsonl", offset)],
+        [workspace],
+        "operator-handoff",
+    )
+
+
 def authored_handoff(claim, timeout):
-    """Resume an existing context once; checking stays closed by the operator command."""
+    """One permission-guarded, capacity-accounted continuation of an existing thread."""
     from .session import command
-    from .group import group_rejected, rejection_event, member_rejection
+    from .group import group_rejected
     from .commands import operator_terminal
     from .assessment import occupied
 
     run = claim.parent.parent
     assignment = read(claim / "assignment.json")
-    blocked = (
+    if (
         (run / "approval-blocker-current.json").exists()
         or group_rejected(claim)
         or any(
@@ -332,8 +409,7 @@ def authored_handoff(claim, timeout):
             for name in ("result.json", "work/result.json", "session/state.json")
             for key in ("approval_rejection", "permission_denied")
         )
-    )
-    if blocked:
+    ):
         atomic(
             claim / "operator-authored-handoff.json",
             {
@@ -342,12 +418,10 @@ def authored_handoff(claim, timeout):
             },
         )
         return
-    session = read(claim / "session/state.json")
-    thread = session.get("thread_id")
+    thread = read(claim / "session/state.json").get("thread_id")
     workspace = claim / "work"
     if not thread:
-        members = read(claim / "collaboration/group.json").get("members", [])
-        for member in members:
+        for member in read(claim / "collaboration/group.json").get("members", []):
             candidate = read(Path(member["workspace"]) / "thread.json").get("thread_id")
             if candidate:
                 thread, workspace = candidate, Path(member["workspace"])
@@ -360,121 +434,94 @@ def authored_handoff(claim, timeout):
         return
     argv = command(run, assignment, thread)
     argv[argv.index("-C") + 1] = str(workspace)
+    state = Path(read(run / "native-app-managed.json")["state_dir"])
     with (
         (claim / "operator-authored-handoff.jsonl").open("ab") as out,
         (claim / "operator-authored-handoff.stderr").open("ab") as err,
     ):
         out.seek(0, 2)
-        log_offset = out.tell()
-        state = Path(read(run / "native-app-managed.json")["state_dir"])
-        with locked(state / "capacity.lock"):
-            cfg = read(state / "config.json")
-            if not operator_terminal(claim) or occupied(cfg, state) >= cfg.get(
-                "worker_capacity", 10
-            ):
-                atomic(
-                    claim / "operator-authored-handoff.json",
-                    {
-                        "status": "skipped_capacity",
-                        "reason": "No free verified slot; mechanical handoff preserved.",
-                    },
-                )
-                return
-            launch = {
-                "intent": True,
-                "workspace": str(workspace),
-                "thread_id": thread,
-                "started_at": time.time(),
-            }
-            atomic(claim / "operator-handoff-process.json", launch)
-            try:
-                proc = subprocess.Popen(
-                    argv,
-                    cwd=workspace,
-                    stdin=subprocess.PIPE,
-                    stdout=out,
-                    stderr=err,
-                    start_new_session=True,
-                )
-            except OSError:
-                atomic(
-                    claim / "operator-handoff-process.json",
-                    {**launch, "finished": True, "launch_failed": True},
-                )
-                raise
-            atomic(claim / "operator-handoff-process.json", {**launch, "pid": proc.pid})
+        offset = out.tell()
+        proc = None
+        status = "interrupted"
+        launch = {
+            "intent": True,
+            "workspace": str(workspace),
+            "thread_id": thread,
+            "log_offset": offset,
+            "started_at": time.time(),
+        }
         try:
+            with locked(state / "capacity.lock"):
+                cfg = read(state / "config.json")
+                if not operator_terminal(claim) or occupied(cfg, state) >= cfg.get(
+                    "worker_capacity", 10
+                ):
+                    atomic(
+                        claim / "operator-authored-handoff.json",
+                        {
+                            "status": "skipped_capacity",
+                            "reason": "No free verified slot; mechanical handoff preserved.",
+                        },
+                    )
+                    return
+                atomic(claim / "operator-handoff-process.json", launch)
+                try:
+                    proc = subprocess.Popen(
+                        argv,
+                        cwd=workspace,
+                        stdin=subprocess.PIPE,
+                        stdout=out,
+                        stderr=err,
+                        start_new_session=True,
+                    )
+                except OSError:
+                    atomic(
+                        claim / "operator-handoff-process.json",
+                        {**launch, "finished": True, "launch_failed": True},
+                    )
+                    raise
+                atomic(
+                    claim / "operator-handoff-process.json", {**launch, "pid": proc.pid}
+                )
             proc.communicate(
                 (Path(__file__).parent / "prompts/operator_handoff.xml").read_bytes(),
                 timeout=timeout,
             )
             status = "finished" if proc.returncode == 0 else "failed"
         except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGTERM)
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
             status = "timed_out"
         finally:
-            if proc.poll() is None:
-                os.killpg(proc.pid, signal.SIGTERM)
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                    proc.wait()
-            atomic(
-                claim / "operator-handoff-process.json",
-                {
-                    **launch,
-                    "pid": proc.pid,
-                    "finished": True,
-                    "exit_code": proc.returncode,
-                },
-            )
-        out.flush()
-        with (claim / "operator-authored-handoff.jsonl").open("rb") as source:
-            source.seek(log_offset)
-            events = []
-            for line in source:
-                try:
-                    events.append(json.loads(line))
-                except ValueError:
-                    continue
-        if any(rejection_event(e) for e in events) or member_rejection(workspace):
-            evidence = {
-                "claim_id": claim.name,
-                "source": "operator-handoff",
-                "report_path": str(claim / "operator-authored-handoff.jsonl"),
-                "at": time.time(),
-            }
-            atomic(claim / "operator-handoff-rejection.json", evidence)
-            if not (run / "approval-blocker-current.json").exists():
-                atomic(run / "approval-blocker-current.json", evidence)
-            try:
-                with (run / "STOP_NEW_CLAIMS").open("x") as stop:
-                    stop.write(
-                        "Approval rejection during operator handoff; operator review required."
+            if proc is not None:
+                if proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        proc.wait()
+                atomic(
+                    claim / "operator-handoff-process.json",
+                    {
+                        **launch,
+                        "pid": proc.pid,
+                        "finished": True,
+                        "exit_code": proc.returncode,
+                    },
+                )
+                out.flush()
+                rejected = latch_handoff_rejection(claim, workspace, offset)
+                atomic(
+                    claim / "operator-authored-handoff.json",
+                    {
+                        "status": "blocked_permission" if rejected else status,
+                        "thread_id": thread,
+                        "exit_code": proc.returncode,
+                    },
+                )
+                if rejected:
+                    raise PermissionError(
+                        "Handoff reported a permission rejection; evidence and claim retained, admissions not resumed."
                     )
-            except FileExistsError:
-                pass
-            atomic(
-                claim / "operator-authored-handoff.json",
-                {
-                    "status": "blocked_permission",
-                    "thread_id": thread,
-                    "exit_code": proc.returncode,
-                },
-            )
-            raise PermissionError(
-                "Handoff reported a permission rejection; evidence and claim retained, admissions not resumed."
-            )
-        atomic(
-            claim / "operator-authored-handoff.json",
-            {"status": status, "thread_id": thread, "exit_code": proc.returncode},
-        )
 
 
 def submit_match(claim, record, best):
@@ -748,6 +795,14 @@ def execute(state, identifier):
                 profile = read(claim.parent.parent / "native-app-profile.json").get(
                     "id"
                 )
+                if (claim.parent.parent / "approval-blocker-current.json").exists():
+                    update(
+                        state,
+                        record,
+                        "completed",
+                        refill_status="Permission stop retained; admissions were not resumed.",
+                    )
+                    return
                 if profile not in read(state / "config.json").get(
                     "paused_profiles", []
                 ):

@@ -799,3 +799,120 @@ def test_rejected_handoff_does_not_release_or_resume_admissions(tmp_path, monkey
     assert read(claim / "operator-command.json")["state"] == "review_required"
     release.assert_not_called()
     start.assert_not_called()
+
+
+def test_cancelled_handoff_latches_rejection_before_propagating_stop(
+    tmp_path, monkeypatch
+):
+    import json
+
+    state, run, claim = fixture(tmp_path)
+    atomic(
+        claim / "session/state.json", {"thread_id": "existing", "streams_closed": True}
+    )
+    (claim / "work").mkdir()
+    monkeypatch.setattr("native_swarm.commands.operator_terminal", lambda _: True)
+    monkeypatch.setattr(
+        "native_swarm.session.command",
+        lambda *a: ["codex", "exec", "-C", str(run), "resume", "existing", "-"],
+    )
+
+    class Proc:
+        pid = 99999999
+        returncode = 1
+
+        def communicate(self, *args, **kwargs):
+            raise SystemExit(0)
+
+        def poll(self):
+            return 1
+
+    def launch(argv, **kwargs):
+        kwargs["stdout"].write(
+            (json.dumps({"type": "error", "code": "approval_denied"}) + "\n").encode()
+        )
+        return Proc()
+
+    monkeypatch.setattr(worker.subprocess, "Popen", launch)
+    with pytest.raises(PermissionError, match="permission rejection"):
+        worker.authored_handoff(claim, 15)
+    assert read(claim / "operator-handoff-rejection.json")
+    assert read(run / "approval-blocker-current.json")
+    assert not operator_retiring(run)
+
+
+def test_retirement_cannot_hide_sibling_failure_and_ack_is_snapshot_bound(tmp_path):
+    state, run, claim = fixture(tmp_path)
+    atomic(
+        claim / "operator-command.json", {"action": "stop_now", "state": "completed"}
+    )
+    worker.stop_tree(claim)
+    retire(run, claim.name)
+    jobs = {"a": {"claim_id": claim.name, "state": "failed_review_required"}}
+    atomic(run / "rolling-executor/journal.json", {"jobs": jobs})
+    (run / "STOP_NEW_CLAIMS").write_text(
+        "Rolling executor stopped: direct Codex process exited nonzero"
+    )
+    assert operator_retiring(
+        run
+    )  # The only failed job is explicitly and verifiably stopped.
+    jobs["b"] = {"claim_id": "sibling", "state": "failed_review_required"}
+    atomic(run / "rolling-executor/journal.json", {"jobs": jobs})
+    assert not operator_retiring(run)
+    retire(run, acknowledge=True)
+    assert operator_retiring(run)
+    jobs["c"] = {"claim_id": "another", "state": "failed_review_required"}
+    atomic(run / "rolling-executor/journal.json", {"jobs": jobs})
+    assert not operator_retiring(
+        run
+    )  # Same STOP text does not acknowledge a later failure.
+
+
+def test_operator_drain_does_not_hide_failure_that_arrives_while_draining(tmp_path):
+    _, run, _ = fixture(tmp_path)
+    atomic(run / "operator-drain.json", {"source": "operator"})
+    (run / "STOP_NEW_CLAIMS").write_text(
+        "Rolling executor stopped: Operator requested a safe drain; no new or replacement workers"
+    )
+    atomic(
+        run / "rolling-executor/journal.json",
+        {"jobs": {"b": {"claim_id": "unrelated", "state": "failed_review_required"}}},
+    )
+    assert not operator_retiring(run)
+
+
+def test_dead_controller_permission_stop_still_blocks_automatic_start(
+    tmp_path, monkeypatch
+):
+    state, run, _ = fixture(tmp_path)
+    atomic(run / "approval-blocker-current.json", {"source": "operator-handoff"})
+    b = Backend(state)
+    quota = Mock()
+    monkeypatch.setattr(b, "quota", quota)
+    with pytest.raises(ControlError, match="Permission stop retained"):
+        b.start()
+    quota.assert_not_called()
+    with pytest.raises(ControlError, match="specific approval"):
+        b.acknowledge_hold(run)
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [
+        "session/turn-001.jsonl",
+        "collaboration/peer-1/stdout.jsonl",
+        "work/codex.stdout.jsonl",
+    ],
+)
+def test_forced_stop_preserves_rejection_from_normal_worker_stream(tmp_path, stream):
+    import json
+
+    _, run, claim = fixture(tmp_path)
+    path = claim / stream
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"type": "error", "code": "approval_denied"}) + "\n")
+    with pytest.raises(PermissionError, match="permission rejection"):
+        worker.stop_tree(claim)
+    assert read(run / "approval-blocker-current.json")["source"] == "operator-stop"
+    assert not operator_retiring(run)
+    assert read(claim / "operator-stop-terminal.json")["verified_stopped"] is True

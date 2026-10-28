@@ -2,6 +2,7 @@
 
 import datetime as dt
 import hashlib
+import json
 from pathlib import Path
 import secrets
 import subprocess
@@ -231,8 +232,24 @@ def handoff_reserved(claim):
     )
 
 
+def failure_rows(run):
+    return {
+        worker: job
+        for worker, job in read(Path(run) / "rolling-executor/journal.json")
+        .get("jobs", {})
+        .items()
+        if "review" in str(job.get("state", ""))
+    }
+
+
+def failure_digest(run):
+    return hashlib.sha256(
+        json.dumps(failure_rows(run), sort_keys=True).encode()
+    ).hexdigest()
+
+
 def operator_retiring(run):
-    """Recognize only operator-originated retirement, never another saved failure."""
+    """A drain cannot conceal an unrelated unresolved job failure."""
     run = Path(run)
     if (run / "approval-blocker-current.json").exists():
         return False
@@ -242,34 +259,34 @@ def operator_retiring(run):
         else ""
     )
     marker = read(run / "operator-retiring.json")
-    if not marker:
-        return (run / "operator-drain.json").exists() and (
-            not stop
-            or stop
-            == "Rolling executor stopped: Operator requested a safe drain; no new or replacement workers"
-        )
-    if not stop:
+    if marker.get("acknowledged_stop_sha256") == hashlib.sha256(
+        stop.encode()
+    ).hexdigest() and marker.get("acknowledged_failures_sha256") == failure_digest(run):
         return True
-    if (
-        marker.get("acknowledged_stop_sha256")
-        == hashlib.sha256(stop.encode()).hexdigest()
-    ):
+    failures = failure_rows(run)
+    for job in failures.values():
+        cid = job.get("claim_id")
+        if not cid:
+            return False
+        claim = run / "claims" / cid
+        closed = read(claim / "giveup-response.json") or read(
+            claim / "submission-response.json"
+        )
+        stopped = (
+            cid in marker.get("claims", [])
+            and operator_terminal(claim)
+            and read(claim / "operator-command.json").get("action") in ACTIONS
+        )
+        if not closed and not stopped:
+            return False
+    drain_stop = "Rolling executor stopped: Operator requested a safe drain; no new or replacement workers"
+    if not marker:
+        return (run / "operator-drain.json").exists() and stop in ("", drain_stop)
+    if stop in ("", drain_stop):
         return True
     return (
         stop == "Rolling executor stopped: direct Codex process exited nonzero"
-        and any(
-            read(run / "claims" / c / "operator-command.json").get("state")
-            in (
-                "stopping",
-                "evidence_preserved",
-                "writing_handoff",
-                "validating_match",
-                "releasing",
-                "completed",
-                "review_required",
-            )
-            for c in marker.get("claims", [])
-        )
+        and bool(failures)
     )
 
 
@@ -280,10 +297,15 @@ def retire(run, claim=None, *, acknowledge=False):
     if claim and claim not in claims:
         claims.append(claim)
     record.update(claims=claims, requested_at=now())
-    if acknowledge and (run / "STOP_NEW_CLAIMS").exists():
-        record["acknowledged_stop_sha256"] = hashlib.sha256(
-            (run / "STOP_NEW_CLAIMS").read_text().strip().encode()
-        ).hexdigest()
+    if acknowledge:
+        record["acknowledged_failures_sha256"] = failure_digest(run)
+    if acknowledge:
+        stop = (
+            (run / "STOP_NEW_CLAIMS").read_text().strip()
+            if (run / "STOP_NEW_CLAIMS").exists()
+            else ""
+        )
+        record["acknowledged_stop_sha256"] = hashlib.sha256(stop.encode()).hexdigest()
     atomic(run / "operator-retiring.json", record)
     atomic(run / "operator-drain.json", {"source": "operator-retirement", "at": now()})
     atomic(

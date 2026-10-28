@@ -293,6 +293,10 @@ class Backend:
         with self.locked():
             if run not in self.runs():
                 raise ControlError("Select a managed controller.")
+            if (run / "approval-blocker-current.json").exists():
+                raise ControlError(
+                    "A permission rejection needs review and specific approval; this hold action does not clear it."
+                )
             retire(run, acknowledge=True)
         return "Controller hold acknowledged for replacement. Start still checks account health and actual capacity."
 
@@ -414,6 +418,11 @@ class Backend:
             cfg = self.config
             if not cfg:
                 raise ControlError("App setup is missing.")
+            for value in cfg.get("managed_runs", []):
+                if (Path(value) / "approval-blocker-current.json").exists():
+                    raise ControlError(
+                        f"Permission stop retained for {Path(value).name}; review approval-blocker-current.json before resuming."
+                    )
             from .commands import operator_retiring, retire
             from .command_worker import recover_completion
 
