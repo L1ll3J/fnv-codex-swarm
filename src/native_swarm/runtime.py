@@ -139,7 +139,20 @@ def configure(root: Path, profile: dict):
     replace_once(
         helper,
         "acquire_args=['python3', str(ROOT / 'acquire.py'), band]",
-        "acquire_args=['python3', str(ROOT / 'acquire.py'), band]\nif '--address' in sys.argv:acquire_args+=['--address',sys.argv[sys.argv.index('--address')+1]]",
+        "acquire_args=[sys.executable, str(ROOT / 'acquire.py'), band]\nif '--address' in sys.argv:acquire_args+=['--address',sys.argv[sys.argv.index('--address')+1]]",
+    )
+    replace_once(
+        helper,
+        "subprocess.run(['python3', str(ROOT / 'assign.py'), worker, cid]",
+        "subprocess.run([sys.executable, str(ROOT / 'assign.py'), worker, cid]",
+    )
+    # These commands execute controller adapters that import native_swarm, not
+    # the official compiler. Keep them on the app interpreter even when the
+    # worker shell or env.sh chooses a different Python.
+    helper.write_text(
+        helper.read_text()
+        .replace("f'python3 ", "f'{sys.executable} ")
+        .replace("'python3'", "sys.executable")
     )
     replace_once(
         root / "rolling_executor.py",
@@ -211,4 +224,5 @@ def configure(root: Path, profile: dict):
 
     if (root / "recorded_fnv_check_v2.py").exists():
         from .tool_runtime import configure as configure_tools
+
         configure_tools(root)

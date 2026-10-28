@@ -47,6 +47,11 @@ def test_real_template_generation_preserves_original_checker(tmp_path, group_siz
         "group_size": group_size,
     }
     configure(tmp_path, profile)
+    helper = (tmp_path / "prepare_assignment.py").read_text()
+    assert "acquire_args=[sys.executable," in helper
+    assert "['python3'" not in helper
+    assert "f'python3 " not in helper
+    assert "f'{sys.executable} " in helper
     for path in tmp_path.glob("*.py"):
         compile(path.read_text(), str(path), "exec")
     assert read(tmp_path / "run-config.json")["model"] == "gpt-6.1-terra"
@@ -256,6 +261,9 @@ def test_actual_managed_inheritance_honors_cutoff_above_fifty(
             sys.modules.pop(name, None)
 
 
+@pytest.mark.skipif(
+    not TEMPLATE.exists(), reason="Local native template is not installed"
+)
 def test_intermediate_results_are_held_before_ingestion_and_resolver_reads(
     tmp_path, monkeypatch
 ):
@@ -320,6 +328,9 @@ def test_intermediate_results_are_held_before_ingestion_and_resolver_reads(
     assert scope["once"]() == []
 
 
+@pytest.mark.skipif(
+    not TEMPLATE.exists(), reason="Local native template is not installed"
+)
 def test_new_recorder_never_reports_a_repaired_rejection_as_free(tmp_path):
     import ast
     from native_swarm.tool_runtime import configure as configure_tools
