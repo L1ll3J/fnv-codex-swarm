@@ -51,16 +51,15 @@ def test_unchecked_packet_score_cannot_create_progress(tmp_path):
     assert p["events"] == []
 
 
-def test_current_checked_seed_can_establish_baseline_after_candidate(tmp_path):
+def test_future_seed_cannot_retroactively_invent_progress(tmp_path):
     atomic(
         tmp_path / "assignment.json", {"server_attempt_seed": {"source_sha256": "seed"}}
     )
-    path = receipt(tmp_path, 1, 10, "new")
+    receipt(tmp_path, 1, 10, "new")
     receipt(tmp_path, 2, 15, "seed")
     p = checked_progress(tmp_path)
     assert p["best"] == 10
-    assert [(r["from"], r["to"]) for r in p["events"]] == [(15, 10)]
-    assert p["events"][0]["manifest"] == str(path)
+    assert p["events"] == []
 
 
 def test_saved_work_and_failed_checks_do_not_reset_progress(tmp_path):
@@ -84,3 +83,34 @@ def test_equal_scores_and_rechecked_sources_never_extend_a_window(tmp_path):
     receipt(tmp_path, 3, 10, "improvement")
     receipt(tmp_path, 4, 11, "worse")
     assert [r["check"] for r in checked_progress(tmp_path)["events"]] == [2]
+
+
+def test_later_better_seed_does_not_revoke_admitted_rounds(tmp_path):
+    from native_swarm.budgets import effective_limits
+
+    atomic(
+        tmp_path / "assignment.json",
+        {
+            "max_batch_rounds": 2,
+            "max_plain_checks": 16,
+            "max_compiler_invocations": 64,
+            "extend_while_improving": True,
+            "improvement_window": 3,
+            "server_attempt_seed": {"source_sha256": "seed"},
+        },
+    )
+    receipt(tmp_path, 1, 15, "initial")
+    improved = receipt(tmp_path, 2, 10, "improved")
+    atomic(
+        tmp_path / "work/batch-rounds/2.json",
+        {
+            "round_number": 2,
+            "batch_id": "second",
+            "results": [{"manifest": str(improved)}],
+        },
+    )
+    limits = effective_limits(tmp_path)
+    assert limits["max_batch_rounds"] == 5
+    receipt(tmp_path, 3, 5, "seed")
+    assert effective_limits(tmp_path) == limits
+    assert [e["check"] for e in checked_progress(tmp_path)["events"]] == [2]

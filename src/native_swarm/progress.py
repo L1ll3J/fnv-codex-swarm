@@ -39,21 +39,14 @@ def checked_progress(claim, records=None, assignment=None):
         records = [read(path) for path in paths]
     supplied = supplied_hashes(claim, assignment)
     scored = [(index, row, checked_score(row)) for index, row in enumerate(records, 1)]
-    baseline = [
-        score
-        for _, row, score in scored
-        if score is not None and row.get("source_sha256") in supplied
-    ]
-    if not baseline:
-        baseline = [score for _, _, score in scored if score is not None][:1]
-    best = min(baseline) if baseline else None
+    best = None
     best_check, best_time = None, None
     events = []
     for index, row, score in scored:
         if score is None or (best is not None and score >= best):
             continue
         previous, best = best, score
-        if row.get("source_sha256") in supplied:
+        if previous is None or row.get("source_sha256") in supplied:
             continue
         best_check = index
         best_time = row.get("finished_at") or row.get("started_at")
