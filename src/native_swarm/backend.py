@@ -82,9 +82,11 @@ class Backend:
                 )
             policy = validate_policy(usage_policy or cfg.get("usage_policy"))
             cfg.update(
-                workers=validate_profiles(cfg["profiles"], capacity)
-                if cfg.get("profiles")
-                else workers,
+                workers=(
+                    validate_profiles(cfg["profiles"], capacity)
+                    if cfg.get("profiles")
+                    else workers
+                ),
                 bands=bands,
                 usage_policy=policy,
                 worker_capacity=capacity,
@@ -151,18 +153,30 @@ class Backend:
                     from .allocation import selected_profile
 
                     if (
-                        selected and selected["instances"] > 0
+                        selected
+                        and selected["instances"] > 0
                         and selected_profile(run, cfg) is None
-                        and process_alive(read(run / ".rolling-executor-owner.json").get("pid"), run)
+                        and process_alive(
+                            read(run / ".rolling-executor-owner.json").get("pid"), run
+                        )
                         and not (run / "STOP_NEW_CLAIMS").exists()
                         and not (run / "operator-drain.json").exists()
-                        and read(run / "operator-admissions-paused.json").get("source") == "profile-allocation"
+                        and read(run / "operator-admissions-paused.json").get("source")
+                        == "profile-allocation"
                     ):
                         handovers.append(run)
                 if selected:
                     control = read(run / "operator-control.json")
                     control["native_app_selection"] = {
-                        key: selected.get(key, {"rounds": 20, "budget_mode": "shared", "extend_while_improving": True, "improvement_window": 3}.get(key))
+                        key: selected.get(
+                            key,
+                            {
+                                "rounds": 20,
+                                "budget_mode": "shared",
+                                "extend_while_improving": True,
+                                "improvement_window": 3,
+                            }.get(key),
+                        )
                         for key in (
                             "priority",
                             "queue_first",
@@ -390,7 +404,9 @@ class Backend:
                             )
                     template = Path(cfg["template_run"])
                     self.verify_template(template, cfg)
-                account = self.preflight(active[0] if active else template, require_idle=False)
+                account = self.preflight(
+                    active[0] if active else template, require_idle=False
+                )
                 created = []
                 try:
                     for profile in missing:
@@ -400,7 +416,10 @@ class Backend:
                     for run in created:
                         atomic(
                             run / "operator-admissions-paused.json",
-                            {"requested_at": self.now(), "reason": "profile start incomplete"},
+                            {
+                                "requested_at": self.now(),
+                                "reason": "profile start incomplete",
+                            },
                         )
                     raise
                 for run in active:

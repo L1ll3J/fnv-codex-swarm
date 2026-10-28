@@ -10,11 +10,13 @@ from .group import group_terminal
 from .group_check import locked
 from .state import atomic, process_alive, read
 
-
 TERMINAL_JOBS = {
-    "awaiting_campaign_closure", "released_before_launch",
-    "own_history_duplicate_resolved_no_launch", "continuation_unavailable_no_launch",
-    "prepare_deferred_cooldown", "band_unavailable_cooldown_no_launch",
+    "awaiting_campaign_closure",
+    "released_before_launch",
+    "own_history_duplicate_resolved_no_launch",
+    "continuation_unavailable_no_launch",
+    "prepare_deferred_cooldown",
+    "band_unavailable_cooldown_no_launch",
     "fresh_unavailable_cooldown_no_launch",
 }
 
@@ -33,9 +35,10 @@ def idle_reason(root):
         if process_alive(job.get("pid"), root):
             return "a worker process is still alive"
     for claim in (root / "claims").glob("*/claim.json"):
-        closed = any(read(claim.parent / name) for name in (
-            "giveup-response.json", "submission-response.json"
-        ))
+        closed = any(
+            read(claim.parent / name)
+            for name in ("giveup-response.json", "submission-response.json")
+        )
         if not closed:
             return "a claim has no acknowledged closure"
         if not group_terminal(claim.parent):
@@ -58,7 +61,9 @@ def terminate_controller(pid, root, expected_owner):
             or read(Path(root) / ".rolling-executor-owner.json") != expected_owner
             or expected_owner.get("pid") != pid
         ):
-            raise RuntimeError("controller process identity changed; ownership retained")
+            raise RuntimeError(
+                "controller process identity changed; ownership retained"
+            )
         signal.pidfd_send_signal(descriptor, signal.SIGTERM)
         if not select.select([descriptor], [], [], 5)[0]:
             raise RuntimeError("idle controller has not exited; replacement deferred")
@@ -86,14 +91,22 @@ def retire_idle(root, state):
         pid = owner.get("pid")
         if type(pid) is not int:
             raise RuntimeError("controller ownership is missing")
-        atomic(root / "operator-profile-handover.json", {
-            "state": "retirement_requested", "owner": owner,
-            "profile": read(root / "native-app-profile.json"),
-        })
+        atomic(
+            root / "operator-profile-handover.json",
+            {
+                "state": "retirement_requested",
+                "owner": owner,
+                "profile": read(root / "native-app-profile.json"),
+            },
+        )
         if process_alive(pid, root):
             terminate_controller(pid, root, owner)
         # Never remove the owner or original journals; they remain audit history.
-        atomic(root / "operator-profile-handover.json", {
-            "state": "retired", "owner": owner,
-            "profile": read(root / "native-app-profile.json"),
-        })
+        atomic(
+            root / "operator-profile-handover.json",
+            {
+                "state": "retired",
+                "owner": owner,
+                "profile": read(root / "native-app-profile.json"),
+            },
+        )

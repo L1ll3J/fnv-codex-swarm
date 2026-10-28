@@ -20,8 +20,17 @@ def request(root, state):
     atomic(marker, {"state": "pending"})
     with (root / "profile-handover.log").open("ab") as log:
         subprocess.Popen(
-            [sys.executable, "-m", "native_swarm.handover_watch", str(state), str(root)],
-            cwd=root, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+            [
+                sys.executable,
+                "-m",
+                "native_swarm.handover_watch",
+                str(state),
+                str(root),
+            ],
+            cwd=root,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
 
 
@@ -34,13 +43,24 @@ def advance(root, backend):
             return True
         cfg = backend.config
         running = read(root / "native-app-profile.json")
-        wanted = next((p for p in backend.profiles() if p["id"] == running.get("id")), None)
+        wanted = next(
+            (p for p in backend.profiles() if p["id"] == running.get("id")), None
+        )
         reason = None
-        if not wanted or wanted["instances"] == 0 or selected_profile(root, cfg) is not None:
+        if (
+            not wanted
+            or wanted["instances"] == 0
+            or selected_profile(root, cfg) is not None
+        ):
             reason = "Profile removed, unallocated or restored to its existing identity"
-        elif (root / "STOP_NEW_CLAIMS").exists() or (root / "operator-drain.json").exists():
+        elif (root / "STOP_NEW_CLAIMS").exists() or (
+            root / "operator-drain.json"
+        ).exists():
             reason = "Protected controller stop or operator drain remains in force"
-        elif read(root / "operator-admissions-paused.json").get("source") != "profile-allocation":
+        elif (
+            read(root / "operator-admissions-paused.json").get("source")
+            != "profile-allocation"
+        ):
             reason = "Operator admission pause remains in force"
         if reason:
             atomic(marker, {"state": "cancelled", "reason": reason})
@@ -49,19 +69,32 @@ def advance(root, backend):
             other = Path(value)
             if other == root:
                 continue
-            if not process_alive(read(other / ".rolling-executor-owner.json").get("pid"), other):
+            if not process_alive(
+                read(other / ".rolling-executor-owner.json").get("pid"), other
+            ):
                 continue
-            if (other / "STOP_NEW_CLAIMS").exists() or (other / "operator-drain.json").exists():
-                atomic(marker, {"state": "blocked", "reason": "Another managed controller has a protected stop or drain"})
+            if (other / "STOP_NEW_CLAIMS").exists() or (
+                other / "operator-drain.json"
+            ).exists():
+                atomic(
+                    marker,
+                    {
+                        "state": "blocked",
+                        "reason": "Another managed controller has a protected stop or drain",
+                    },
+                )
                 return True
             profile = read(other / "native-app-profile.json")
             if profile.get("id") == wanted["id"]:
                 compatible = selected_profile(other, cfg) is not None
-                atomic(marker, {
-                    "state": "completed" if compatible else "blocked",
-                    "replacement": value,
-                    "reason": "Another controller already owns this profile",
-                })
+                atomic(
+                    marker,
+                    {
+                        "state": "completed" if compatible else "blocked",
+                        "replacement": value,
+                        "reason": "Another controller already owns this profile",
+                    },
+                )
                 return True
         if idle_reason(root):
             return False
