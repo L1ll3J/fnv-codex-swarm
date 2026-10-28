@@ -37,3 +37,19 @@ def test_accepts_rtm_only_with_successful_official_plain_result():
         + "  (under your --flags, not the pack's /O2: the site does not accept this yet.)"
     )
     assert not accepted_match(0, proof, pack)[0]
+
+
+def test_vc8_match_requires_the_vc8_pack_and_official_annotation():
+    from native_swarm.checker_result import RTM_SUFFIX, VC8_SUFFIX
+
+    pack = {"compiler": "vc8", "flags": ["/O2"], "accept_also": [["/Od"]]}
+    assert accepted_match(0, "MATCH" + VC8_SUFFIX, pack) == (True, ["/O2"])
+    alternate = (
+        "MATCH  (under /Od, a flag set this function also accepts: submit it as it is)"
+    )
+    assert accepted_match(0, alternate + VC8_SUFFIX, pack) == (True, ["/Od"])
+    assert not accepted_match(0, "MATCH" + VC8_SUFFIX, {"flags": ["/O2"]})[0]
+    assert not accepted_match(0, "MATCH", pack)[0]
+    assert not accepted_match(0, "MATCH" + RTM_SUFFIX, pack)[0]
+    assert not accepted_match(1, "MATCH" + VC8_SUFFIX, pack)[0]
+    assert not accepted_match(0, alternate + VC8_SUFFIX + " extra", pack)[0]

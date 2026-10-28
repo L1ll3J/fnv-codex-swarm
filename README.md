@@ -7,7 +7,7 @@ For an already configured installation, run its `./swarm` launcher or the instal
 ## Controls
 
 - **Workers:** actual model/reasoning, live agents, function size, recorded checks and rounds, best-score history, lease and errors. Open the exact rendered prompt or collaboration board for the selected function. Local MATCH, submitted/pending and independently verified remain separate states.
-- **Worker profiles:** set model, reasoning, largest/smallest/random priority, multiple size brackets, queue preference, concurrent functions, agents per function, batch rounds (default 20), and shared/per-member team budgets. Round settings apply to newly assigned functions; existing assignments keep their original ceilings. Brackets filter both automatic picks and queued work; incompatible queue entries stay queued. Total worker capacity is configurable in Settings (default ten). New profiles start with zero slots; edit concurrent functions and agents per function to allocate them. The profile list and editor show allocated/free slots. Start skips zero-slot profiles and requires at least one allocated slot. Each native profile supports up to 75 concurrent functions; larger totals can be split across profiles. Each profile controller has one fixed model; multiple profiles may use the same model. Selection preferences and concurrent-function counts apply to future admissions. Removed or zero-slot profiles stop admitting work; existing tasks finish under their original assignments. Model, reasoning, agents-per-function and prompt changes require fresh controllers. Freed physical slots become available to the saved solo/team split without exceeding the global capacity.
+- **Worker profiles:** set model, reasoning, largest/smallest/random/recently returned priority, multiple size brackets, queue preference, concurrent functions, agents per function, batch rounds (default 20), and shared/per-member team budgets. Recently returned favors functions reopened most recently; it is a selection preference, not evidence that a function is easier. Round settings apply to newly assigned functions; existing assignments keep their original ceilings. Brackets filter both automatic picks and queued work; incompatible queue entries stay queued. Total worker capacity is configurable in Settings (default ten). New profiles start with zero slots; edit concurrent functions and agents per function to allocate them. The profile list and editor show allocated/free slots. Start skips zero-slot profiles and requires at least one allocated slot. Each native profile controller supports up to 75 concurrent functions; larger totals can be split across profiles. Each profile controller has one fixed model; multiple profiles may use the same model. Selection preferences and concurrent-function counts apply to future admissions. Removed or zero-slot profiles stop admitting work; existing tasks finish under their original assignments. Model, reasoning, agents-per-function and prompt changes require fresh controllers. Freed physical slots become available to the saved solo/team split without exceeding the global capacity.
 - **Best history / Queue:** queue a checked unfinished source for any queue-enabled profile or a specific profile. Historical scores are starting evidence, not fresh checks. The native seed installer verifies source/log hashes and records old/new pack provenance. Reservations are atomic; uncertain acquisitions remain held for review. A durable closure receipt makes an assigned queue item complete and eligible to requeue.
 - **Prompts:** edit independent-worker or generalist-team templates. Operator edits are versioned locally; existing model sessions keep their actual prompt. Defaults contain the individually approved blocker wording; team defaults also contain the approved collaboration wording. Existing operator-authored overrides are preserved.
 - **Blocker reports:** inspect reports from independent workers and every collaboration peer. Local assessments distinguish observations, suspected blockers, established blockers and resolved reports. Agent reports are initially unassessed. Flag submission requires confirmation that checked evidence establishes a defect preventing a permitted solution, as well as reviewing an editable factual note, official category and exact payload, then explicit confirmation. Actual responses and uncertain writes are retained; ambiguous writes are never automatically resent.
@@ -46,7 +46,7 @@ The app uses Codex from `PATH`, or discovers a compatible user VS Code Codex ext
 ### Automatic official tools and data
 
 New assignments refresh the official checker archive, function index, symbols,
-compiler tips and upstream agent guidance into validated content-addressed
+compiler tips, large-function guidance and upstream agent guidance into validated content-addressed
 snapshots. Freshness checks are shared across profiles and cached for five
 minutes; failed refreshes retain the last good snapshot and block new admissions
 until retry, without changing active assignments. Every assignment binds its
@@ -88,16 +88,27 @@ manifest. This is application code from the configured repository, not arbitrary
 URLs supplied by a worker or report.
 
 
-### VC++ 2008 RTM fallback
+### Supported compiler generations
 
-The audited 27 October checker generation supports SP1 15.00.30729.01 and
-RTM 15.00.21022.08. Install RTM separately; never overwrite SP1. By default the
-app looks for `~/fnvdecomp/tools/msvc9` and the optional sibling `msvc9rtm`.
+The audited 28 October checker generation supports VC++ 2008 SP1 15.00.30729.01,
+VC++ 2008 RTM 15.00.21022.08 and VC++ 2005 SP1 14.00.50727.762.
+Install each separately; never overwrite SP1. By default the
+app looks for `~/fnvdecomp/tools/msvc9` and the optional siblings `msvc9rtm` and `msvc8`.
 Override these roots with an owner-controlled `compiler-toolchains.json` in
-the app state directory, for example `{"sp1":"/tools/msvc9","rtm":"/tools/msvc9rtm"}`.
+the app state directory, for example `{"sp1":"/tools/msvc9","rtm":"/tools/msvc9rtm","vc8":"/tools/msvc8"}`.
 New assignment generations record compiler versions and core component hashes;
 existing assignments retain their recorded environment. An unrecorded ambient
-`FNVCHECK_RTM_ROOT` cannot silently enable fallback on an older assignment.
+compiler override cannot silently change an older assignment. The official checker
+selects VC8 only for packs marked `compiler: vc8`; missing VC8 blocks preparation
+of those assignments. Ordinary packs use SP1 with RTM fallback on near misses,
+including integer code. Exact compiler annotations are validated at the independent
+submission gate and when preparing operator flag proofs.
+
+For this generation, recorded checks retain whole-function comparison scores,
+exact-region and stack-slot diagnostics, and a `full_diff_path` receipt field when
+a complete aligned diff was produced. Large-function guidance is available as
+`resource_paths.large_functions`. Older assignments keep their original diagnostic
+options and compiler generation.
 
 The recorder reserves up to twenty internal compiler calls per accepted flag
 set for this generation, covering both compilers' repair passes. Profile round

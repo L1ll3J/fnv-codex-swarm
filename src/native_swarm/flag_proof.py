@@ -159,12 +159,18 @@ def prepare(report, source_path, flags, *, call=service, invoke=subprocess.run):
             "MATCH  (under your --flags, not the pack's %s: the site does not accept this yet. To report it, save this code with checkpoint and flag the function with compile_flags and checkpoint_id)"
             % " ".join(pack["flags"])
         )
-        from .checker_result import RTM_SUFFIX
+        from .checker_result import RTM_SUFFIX, VC8_SUFFIX
 
         lines = result.stdout.splitlines()
         first = lines[0] if lines else ""
         rtm_expected = "MATCH" + RTM_SUFFIX + expected[len("MATCH") :]
-        if result.returncode != 0 or first not in (expected, rtm_expected):
+        vc8_expected = "MATCH" + VC8_SUFFIX + expected[len("MATCH") :]
+        allowed = (
+            (vc8_expected,)
+            if pack.get("compiler") == "vc8"
+            else (expected, rtm_expected)
+        )
+        if result.returncode != 0 or first not in allowed:
             raise ValueError(
                 "Alternate flags did not establish an official proof MATCH; diagnostics retained"
             )

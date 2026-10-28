@@ -44,6 +44,18 @@ def configure(root):
         "'recorded-check',str(BASE/'.venv/bin/python')",
         "'recorded-check','env',*(environment(tool_context,claim) if tool_context else []),str(BASE/'.venv/bin/python')",
     )
+    # New generations support complete diagnostic artifacts without additional
+    # compiler calls. Leave legacy assignments on their original CLI options.
+    replace_once(
+        recorder,
+        "str(snapshot),'--json']",
+        "str(snapshot),'--json',*(['--full-diff',str(records/('diff-%03d.txt'%n)),'--slots'] if tool_context and tool_context.get('full_diagnostics') else [])]",
+    )
+    replace_once(
+        recorder,
+        "'checker_result':check,'log_path':str(log)",
+        "'checker_result':check,'full_diff_path':str(records/('diff-%03d.txt'%n)) if (records/('diff-%03d.txt'%n)).is_file() else None,'log_path':str(log)",
+    )
     replace_once(
         recorder,
         "'schema':'fnv-recorded-check/2'",

@@ -64,3 +64,24 @@ def test_rtm_is_bound_in_generation_and_environment(tmp_path, monkeypatch):
     assert "FNVCHECK_RTM_ROOT=" in tools.environment(
         {"directory": tmp_path, "checker": tmp_path}, tmp_path
     )
+
+
+def test_discover_vc8_binds_identity_and_clears_ambient_compiler(tmp_path):
+    from native_swarm.state import atomic
+
+    roots = {name: str(compiler(tmp_path, name)) for name in toolchains.VERSIONS}
+    atomic(tmp_path / "compiler-toolchains.json", roots)
+    records = toolchains.discover(tmp_path)
+    assert records["vc8"]["version"] == [14, 0, 50727, 762]
+    toolchains.validate(records)
+    env = dict(
+        item.split("=", 1)
+        for item in tools.environment(
+            {"directory": tmp_path, "checker": tmp_path, "toolchains": records},
+            tmp_path,
+        )
+    )
+    assert env["FNVCHECK_VC8_ROOT"] == roots["vc8"]
+    assert env["FNVCHECK_COMPILER"] == "sp1"
+    legacy = tools.environment({"directory": tmp_path, "checker": tmp_path}, tmp_path)
+    assert "FNVCHECK_VC8_ROOT=" in legacy
