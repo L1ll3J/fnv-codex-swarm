@@ -1,10 +1,10 @@
 """Short-lived deterministic watcher for an explicitly edited active profile."""
 
 import fcntl
-from pathlib import Path
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 from .allocation import selected_profile
 from .handover import idle_reason, retire_idle

@@ -1,9 +1,9 @@
 """Retire only positively idle controllers whose saved profile identity changed."""
 
 import os
-from pathlib import Path
 import select
 import signal
+from pathlib import Path
 
 from .allocation import selected_profile, sync
 from .group import group_terminal
