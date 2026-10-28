@@ -30,7 +30,7 @@ def test_idle_withdrawn_controller_retires_only_its_owner(tmp_path, monkeypatch)
     atomic(claim / "giveup-response.json", {"released": True})
     atomic(root / "rolling-executor/journal.json", {"jobs": {"finished": {"state": "awaiting_campaign_closure", "pid": 456}}})
     retire_idle(root, state)
-    terminate.assert_called_once_with(123, root)
+    terminate.assert_called_once_with(123, root, {"pid": 123})
     assert read(root / "operator-profile-handover.json")["state"] == "retired"
     assert read(root / ".rolling-executor-owner.json")["pid"] == 123
     assert read(claim / "giveup-response.json")["released"] is True

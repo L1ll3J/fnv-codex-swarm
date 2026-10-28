@@ -43,7 +43,7 @@ def idle_reason(root):
     return None
 
 
-def terminate_controller(pid, root):
+def terminate_controller(pid, root, expected_owner):
     """Signal the verified process through a stable kernel handle, never a PID race."""
     if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
         raise RuntimeError("safe controller retirement requires Linux pidfd support")
@@ -52,7 +52,12 @@ def terminate_controller(pid, root):
     except ProcessLookupError:
         return
     try:
-        if not process_alive(pid, root):
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        if (
+            str(Path(root) / "app_controller.py").encode() not in command
+            or read(Path(root) / ".rolling-executor-owner.json") != expected_owner
+            or expected_owner.get("pid") != pid
+        ):
             raise RuntimeError("controller process identity changed; ownership retained")
         signal.pidfd_send_signal(descriptor, signal.SIGTERM)
         if not select.select([descriptor], [], [], 5)[0]:
@@ -86,7 +91,7 @@ def retire_idle(root, state):
             "profile": read(root / "native-app-profile.json"),
         })
         if process_alive(pid, root):
-            terminate_controller(pid, root)
+            terminate_controller(pid, root, owner)
         # Never remove the owner or original journals; they remain audit history.
         atomic(root / "operator-profile-handover.json", {
             "state": "retired", "owner": owner,

@@ -395,7 +395,7 @@ def test_resume_retires_idle_changed_profile_and_starts_replacement(tmp_path, mo
     monkeypatch.setattr("native_swarm.backend.process_alive", lambda pid, root: pid in live)
     monkeypatch.setattr("native_swarm.handover.process_alive", lambda pid, root: pid in live)
     stopped = []
-    def terminate(pid, root):
+    def terminate(pid, root, owner):
         live.remove(pid)
         stopped.append(root)
     monkeypatch.setattr("native_swarm.handover.terminate_controller", terminate)
