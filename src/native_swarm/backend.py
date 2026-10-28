@@ -115,6 +115,7 @@ class Backend:
 
     def save_profiles(self, profiles, *, expected=None):
         known = {p["id"] for p in profiles}
+        handovers = []
         from .group_check import locked
         from .allocation import sync
 
@@ -147,6 +148,17 @@ class Backend:
                 selected = by_id.get(active.get("id"))
                 if (run / "native-app-managed.json").exists():
                     sync(run, cfg)
+                    from .allocation import selected_profile
+
+                    if (
+                        selected and selected["instances"] > 0
+                        and selected_profile(run, cfg) is None
+                        and process_alive(read(run / ".rolling-executor-owner.json").get("pid"), run)
+                        and not (run / "STOP_NEW_CLAIMS").exists()
+                        and not (run / "operator-drain.json").exists()
+                        and read(run / "operator-admissions-paused.json").get("source") == "profile-allocation"
+                    ):
+                        handovers.append(run)
                 if selected:
                     control = read(run / "operator-control.json")
                     control["native_app_selection"] = {
@@ -163,7 +175,11 @@ class Backend:
                     }
                     control["native_app_bands"] = selected["bands"]
                     atomic(run / "operator-control.json", control)
-        return "Allocation and selection saved for future admissions. Current tasks finish normally. Model, reasoning and team-size changes require fresh controllers."
+        from .handover_watch import request
+
+        for run in handovers:
+            request(run, self.state)
+        return "Allocation and selection saved. Current tasks finish normally; changed profiles hand over automatically after their work closes."
 
     def prompt(self, group=False):
         default = (
@@ -325,12 +341,20 @@ class Backend:
                 by_id = {p["id"]: p for p in profiles}
                 represented = set()
                 retired = []
+                pending = []
                 for run in active:
                     running = read(run / "native-app-profile.json")
                     wanted = selected_profile(run, cfg)
                     if running.get("id") in by_id and wanted is None:
-                        from .handover import retire_idle
+                        from .handover import idle_reason, retire_idle
 
+                        if idle_reason(run):
+                            from .handover_watch import request
+
+                            request(run, self.state)
+                            represented.add(running["id"])
+                            pending.append(run)
+                            continue
                         try:
                             retire_idle(run, self.state)
                         except RuntimeError as exc:
@@ -389,6 +413,11 @@ class Backend:
                 (self.state / "assessment-admissions-paused.json").unlink(
                     missing_ok=True
                 )
+                if pending:
+                    return (
+                        f"Admissions resumed; {len(pending)} profile handover(s) will finish "
+                        "automatically after their current work closes."
+                    )
                 return (
                     f"Admissions resumed; started {len(created)} new profile controller(s). "
                     "Existing workers keep running under the saved allocations and total capacity."

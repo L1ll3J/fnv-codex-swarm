@@ -46,6 +46,7 @@ def fixture(tmp_path, monkeypatch):
         },
     )
     monkeypatch.setattr("native_swarm.policy.process_alive", lambda pid, root: True)
+    monkeypatch.setattr("native_swarm.handover_watch.request", Mock())
     return Backend(state), sol, terra, team
 
 
@@ -262,8 +263,7 @@ def test_resume_refuses_changed_identity_until_original_controller_stops(
     b.save_profiles(selected)
     create = Mock()
     monkeypatch.setattr(b, "create_run", create)
-    with pytest.raises(ControlError, match="waiting for its existing work"):
-        b.start()
+    assert "handover(s)" in b.start()
     assert read(sol / "native-app-profile.json")["model"] == "gpt-6.1-sol"
     create.assert_not_called()
 
@@ -408,3 +408,24 @@ def test_resume_retires_idle_changed_profile_and_starts_replacement(tmp_path, mo
     assert create.call_args.args[3]["model"] == "gpt-6.1-terra"
     assert read(sol / "operator-profile-handover.json")["state"] == "retired"
     b.preflight.assert_called_once_with(terra, require_idle=False)
+
+
+def test_editing_live_identity_requests_automatic_handover(tmp_path, monkeypatch):
+    b, sol, terra, team = resume_fixture(tmp_path, monkeypatch)
+    from native_swarm.handover_watch import request
+    selected = b.profiles()
+    selected[0]["model"] = "gpt-6.1-terra"
+    b.save_profiles(selected)
+    request.assert_called_once_with(sol, b.state)
+    assert read(sol / "operator-admissions-paused.json")["source"] == "profile-allocation"
+
+
+def test_edit_does_not_schedule_handover_under_manual_pause(tmp_path, monkeypatch):
+    b, sol, _, _ = resume_fixture(tmp_path, monkeypatch)
+    from native_swarm.handover_watch import request
+    atomic(sol / "operator-admissions-paused.json", {"reason": "operator paused"})
+    selected = b.profiles()
+    selected[0]["group_size"] = 2
+    selected[0]["instances"] = 1
+    b.save_profiles(selected)
+    request.assert_not_called()
