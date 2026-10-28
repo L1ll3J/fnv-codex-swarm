@@ -1,4 +1,4 @@
-"""Operator-enabled, capacity-accounted read-only blocker assessment."""
+"""Fresh read-only blocker assessments with independent operator capacity."""
 
 import hashlib
 import html
@@ -16,6 +16,12 @@ from .policy import evaluate
 from .state import Projection, atomic, process_alive, read
 
 MODEL = "gpt-6.1-sol"
+
+
+def assessor_policy(cfg):
+    return cfg.get("assessor", {}).get("usage_policy") or cfg.get("usage_policy")
+
+
 SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -212,7 +218,7 @@ def occupied(cfg, state=None):
                 or job.get("state") == "launch_intent"
             ):
                 total += group_size
-    return total + (len(assessor_running(state)) if state else 0)
+    return total
 
 
 def requested(state):
@@ -227,10 +233,35 @@ def requested(state):
 def start(state):
     state = Path(state)
     with locked(state / "assessment-start.lock"):
+        from .backend import Backend
+
+        with Backend(state).locked():
+            cfg = read(state / "config.json")
+            cfg.setdefault("assessor", {})["enabled"] = True
+            atomic(state / "config.json", cfg)
         (state / "assessment-admissions-paused.json").unlink(missing_ok=True)
         value = read(state / "assessment-service.json")
         if process_alive(value.get("pid"), state):
-            return "Sol-medium assessor is already enabled."
+            if value.get("version") == 2:
+                return "Automatic blocker assessment is already enabled."
+            atomic(
+                state / "assessment-admissions-paused.json",
+                {"source": "service-upgrade"},
+            )
+            with (state / "assessment-service.log").open("ab") as log:
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-m",
+                        "native_swarm.assessment",
+                        "--upgrade",
+                        str(state),
+                    ],
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            return "Assessor service upgrade queued; active assessment finishes before migration."
         with (state / "assessment-service.log").open("ab") as log:
             proc = subprocess.Popen(
                 [sys.executable, "-m", "native_swarm.assessment", str(state)],
@@ -242,12 +273,13 @@ def start(state):
             state / "assessment-service.json",
             {
                 "pid": proc.pid,
+                "version": 2,
                 "heartbeat": time.time(),
                 "pending": True,
                 "status": "starting",
             },
         )
-    return "Sol-medium assessor enabled; it waits for a free slot and fresh usage allowance."
+    return "Automatic blocker assessment enabled, with independent assessor capacity."
 
 
 def observed_session(thread, cwd):
@@ -316,9 +348,10 @@ def assess(
     state, report, rows, fingerprint, payload, roots, proc_start=subprocess.Popen
 ):
     cfg = read(state / "config.json")
-    if occupied(cfg, state) + 1 > cfg.get("worker_capacity", 10) or assessor_running(
-        state
-    ):
+    settings = cfg.get("assessor", {})
+    model = settings.get("model", MODEL)
+    effort = settings.get("effort", "medium")
+    if len(assessor_running(state)) >= settings.get("capacity", 1):
         return False
     directory = state / "assessments" / (fingerprint + "-" + str(time.time_ns()))
     directory.mkdir(parents=True)
@@ -337,7 +370,7 @@ def assess(
         "--ignore-user-config",
         "--skip-git-repo-check",
         "--model",
-        MODEL,
+        model,
         "--sandbox",
         "read-only",
         "-c",
@@ -347,7 +380,7 @@ def assess(
         "-c",
         "agents.enabled=false",
         "-c",
-        'model_reasoning_effort="medium"',
+        "model_reasoning_effort=" + json.dumps(effort),
         "-C",
         str(directory),
         "--json",
@@ -360,24 +393,22 @@ def assess(
     proc = None
     try:
         with (
-            locked(state / "capacity.lock"),
+            locked(state / "assessment-launch.lock"),
             (directory / "stdout.jsonl").open("wb") as out,
             (directory / "stderr.log").open("wb") as err,
         ):
             cfg = read(state / "config.json")
             if (
-                occupied(cfg, state) + 1 > cfg.get("worker_capacity", 10)
-                or assessor_running(state)
+                len(assessor_running(state))
+                >= cfg.get("assessor", {}).get("capacity", 1)
                 or (state / "assessment-admissions-paused.json").exists()
             ):
                 return False
-            if evaluate(read(Path(cfg["quota_path"])), cfg.get("usage_policy"))[
-                "reached"
-            ]:
+            if evaluate(read(Path(cfg["quota_path"])), assessor_policy(cfg))["reached"]:
                 return False
             atomic(
                 directory / "launch.json",
-                {"intent": True, "at": time.time(), "model": MODEL},
+                {"intent": True, "at": time.time(), "model": model},
             )
             proc = proc_start(
                 argv,
@@ -389,7 +420,7 @@ def assess(
             )
             atomic(
                 directory / "launch.json",
-                {"pid": proc.pid, "at": time.time(), "model": MODEL},
+                {"pid": proc.pid, "at": time.time(), "model": model},
             )
             proc.stdin.write(prompt.encode())
             proc.stdin.close()
@@ -399,19 +430,9 @@ def assess(
             if time.time() - last_refresh >= 30:
                 refresh_allowance(state, cfg)
                 last_refresh = time.time()
-            atomic(
-                state / "assessment-service.json",
-                {
-                    "pid": os.getpid(),
-                    "pending": True,
-                    "heartbeat": time.time(),
-                    "status": "assessing",
-                    "report": report["id"],
-                },
-            )
             policy = evaluate(
                 read(Path(cfg["quota_path"])),
-                read(state / "config.json").get("usage_policy"),
+                assessor_policy(read(state / "config.json")),
             )
             if time.time() >= until or (
                 policy["reached"] and policy["mode"] == "stop_immediately"
@@ -438,7 +459,7 @@ def assess(
             raise ValueError("Missing genuine assessor thread/completion")
         thread = next(iter(threads))
         observed = observed_session(thread, directory)
-        if observed.get("model") != MODEL:
+        if observed.get("model") != model:
             raise ValueError("Actual assessor model unverified")
         value = validate_result(read(directory / "answer.json"), roots)
         atomic(
@@ -484,58 +505,130 @@ def refresh_allowance(state, cfg):
 
 
 def serve(state):
+    import concurrent.futures
+
     state = Path(state).resolve()
     last_refresh = 0
+    active = {}
     with locked(state / "assessment-owner.lock"):
         while True:
             cfg = read(state / "config.json")
+            settings = cfg.get("assessor", {})
+            for key, (future, executor) in list(active.items()):
+                if future.done():
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        atomic(
+                            state / "assessment-error.json",
+                            {"fingerprint": key, "error": str(exc), "at": time.time()},
+                        )
+                    executor.shutdown(wait=False)
+                    del active[key]
             snapshot = Projection().snapshot(paths(cfg), Path(cfg["quota_path"]))
             reports = annotated(state, snapshot["blockers"], snapshot["rows"])
-            pending = next((r for r in reports if not r["assessment"]), None)
-            if (state / "assessment-admissions-paused.json").exists():
-                pending = None
+            reviews = read(state / "reviews.json")
+            pending = [
+                r
+                for r in reports
+                if not r["assessment"]
+                and reviews.get(r["id"], {}).get("status")
+                not in ("observation", "resolved")
+            ]
+            paused = (
+                state / "assessment-admissions-paused.json"
+            ).exists() or not settings.get("enabled", True)
             atomic(
                 state / "assessment-service.json",
                 {
                     "pid": os.getpid(),
+                    "version": 2,
                     "pending": bool(pending),
+                    "active": len(active),
+                    "capacity": settings.get("capacity", 1),
                     "heartbeat": time.time(),
-                    "status": "waiting for slot/allowance"
+                    "status": "paused"
+                    if paused
+                    else "assessing"
+                    if active
+                    else "waiting for allowance"
                     if pending
-                    else "paused"
-                    if (state / "assessment-admissions-paused.json").exists()
                     else "idle",
                 },
             )
-            if pending and time.time() - last_refresh >= 30:
+            if pending and not paused and time.time() - last_refresh >= 30:
                 refresh_allowance(state, cfg)
                 last_refresh = time.time()
-            if pending:
-                # Imported/older active controllers cannot participate in capacity reservation.
-                incompatible = any(
-                    process_alive(
-                        read(root / ".rolling-executor-owner.json").get("pid"), root
-                    )
-                    and read(root / "native-app-managed.json").get(
-                        "supervision_version"
-                    )
-                    != 2
-                    for root in paths(cfg)
-                )
-                try:
-                    allowed = not evaluate(
-                        read(Path(cfg["quota_path"])), cfg.get("usage_policy")
-                    )["reached"]
-                except (ValueError, KeyError, TypeError):
-                    allowed = False
-                if allowed and not incompatible:
-                    fingerprint, payload, roots = evidence(pending, snapshot["rows"])
-                    assess(
-                        state, pending, snapshot["rows"], fingerprint, payload, roots
-                    )
-            time.sleep(2)
+            try:
+                policy = evaluate(read(Path(cfg["quota_path"])), assessor_policy(cfg))
+                allowed = not policy["reached"]
+                capacity = int(settings.get("capacity", 1) * policy["fraction"])
+            except (ValueError, KeyError, TypeError):
+                allowed = False
+            if allowed and not paused:
+                for report in pending:
+                    if len(active) >= capacity:
+                        break
+                    fingerprint, payload, roots = evidence(report, snapshot["rows"])
+                    if fingerprint not in active:
+                        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                        future = executor.submit(
+                            assess,
+                            state,
+                            report,
+                            snapshot["rows"],
+                            fingerprint,
+                            payload,
+                            roots,
+                        )
+                        active[fingerprint] = (future, executor)
+            time.sleep(1)
+
+
+def upgrade(state):
+    """Replace only the old idle CPU service, never an active assessor model."""
+    import select
+
+    state = Path(state)
+    with locked(state / "assessment-upgrade.lock"):
+        while True:
+            with (
+                locked(state / "assessment-launch.lock"),
+                locked(state / "capacity.lock"),
+            ):
+                value = read(state / "assessment-service.json")
+                if value.get("version") == 2:
+                    return
+                pid = value.get("pid")
+                if not assessor_running(state):
+                    if process_alive(pid, state):
+                        fd = os.pidfd_open(pid)
+                        try:
+                            argv = (
+                                Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+                            )
+                            if (
+                                b"native_swarm.assessment" not in argv
+                                or str(state).encode() not in argv
+                                or read(state / "assessment-service.json").get("pid")
+                                != pid
+                            ):
+                                raise RuntimeError(
+                                    "Assessor service identity changed; upgrade withheld."
+                                )
+                            signal.pidfd_send_signal(fd, signal.SIGTERM)
+                            if not select.select([fd], [], [], 5)[0]:
+                                raise RuntimeError("Old assessor service did not stop.")
+                        finally:
+                            os.close(fd)
+                    break
+            time.sleep(1)
+        start(state)
 
 
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    serve(sys.argv[1])
+    if sys.argv[1] == "--upgrade":
+        upgrade(sys.argv[2])
+    else:
+        serve(sys.argv[1])

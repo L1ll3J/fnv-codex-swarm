@@ -93,19 +93,14 @@ class ManagedExecutor(RandomExecutor):
         store = OperatorStore(
             read_json(self.root / "native-app-managed.json")["state_dir"]
         )
-        item = (
-            store.reserve(
-                profile["id"],
-                worker,
-                eligible=lambda target: (
-                    base.band(target["bytes"]) in self.configured_mix()
-                ),
-            )
-            if profile["queue_first"]
-            else None
+        item = store.reserve(
+            profile["id"],
+            worker,
+            queue_enabled=profile["queue_first"],
+            eligible=lambda target: base.band(target["bytes"]) in self.configured_mix(),
         )
         extra = []
-        if item:
+        if item and item["target"].get("source_path"):
             directory = self.root / "selected-admissions"
             directory.mkdir(exist_ok=True)
             targets = read_json(self.root / "selected-targets.json", {"targets": []})
@@ -118,7 +113,12 @@ class ManagedExecutor(RandomExecutor):
                 {"worker": worker, "state": "reserved", "target": item["target"]},
             )
             extra = ["--selected-row", str(reservation)]
-        elif profile["priority"] != "random":
+        elif item:
+            extra = ["--address", item["target"]["address"]]
+        elif profile["priority"] != "random" or any(
+            r.get("mode") == "exclusive"
+            for r in read_json(store.state / "routes.json", {}).values()
+        ):
             rows = ordered_functions(
                 call, list(self.configured_mix()), profile["priority"], base.band
             )
@@ -126,7 +126,21 @@ class ManagedExecutor(RandomExecutor):
                 str(read_json(Path(c["path"]) / "claim.json")["address"])
                 for c in base.live_claims(self.root).values()
             }
-            row = next((r for r in rows if str(r["address"]) not in own), None)
+            from native_swarm.routing import allowed
+
+            if profile["priority"] == "random":
+                import random
+
+                random.SystemRandom().shuffle(rows)
+            row = next(
+                (
+                    r
+                    for r in rows
+                    if str(r["address"]) not in own
+                    and allowed(store.state, str(r["address"]), profile["id"])
+                ),
+                None,
+            )
             if row is None:
                 log_path.write_text(
                     "BOUNDED_CONTINUATION_UNAVAILABLE_NO_FALLBACK: catalog has no eligible target\n"
@@ -163,7 +177,9 @@ class ManagedExecutor(RandomExecutor):
                     (
                         "queued"
                         if withdrawn
-                        else "unavailable" if definite else "review_required"
+                        else "unavailable"
+                        if definite
+                        else "review_required"
                     ),
                     log=str(log_path),
                 )
@@ -182,7 +198,7 @@ class ManagedExecutor(RandomExecutor):
 
     def launch(self, worker, claim_dir, assignment):
         from native_swarm.group_check import locked
-        from native_swarm.assessment import occupied, requested, assessor_running
+        from native_swarm.assessment import occupied
 
         state = Path(read_json(self.root / "native-app-managed.json")["state_dir"])
         with locked(state / "capacity.lock"):
@@ -193,16 +209,14 @@ class ManagedExecutor(RandomExecutor):
                 or len(self.active) >= value["target"]
                 or (self.root / "operator-admissions-paused.json").exists()
             ):
-                self.journal["jobs"][worker][
-                    "state"
-                ] = "prepared_waiting_transient_gate"
+                self.journal["jobs"][worker]["state"] = (
+                    "prepared_waiting_transient_gate"
+                )
                 self.journal_save()
                 return False
             if occupied(cfg, state) + read_json(
                 self.root / "native-app-profile.json"
-            ).get("group_size", 1) > cfg.get("worker_capacity", 10) - int(
-                requested(state) and not assessor_running(state)
-            ):
+            ).get("group_size", 1) > cfg.get("worker_capacity", 10):
                 job = self.journal["jobs"][worker]
                 job["state"] = "prepared_waiting_transient_gate"
                 self.journal_save()

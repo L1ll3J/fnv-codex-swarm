@@ -382,3 +382,54 @@ def test_default_settings_refresh_fallback_allocation_before_adding_profile(tmp_
             await pilot.press("ctrl+q")
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=20))
+
+
+def test_command_center_forms_expose_scopes_routing_and_separate_assessor(tmp_path, monkeypatch):
+    from native_swarm.dialogs import CommandEditor, TargetEditor, AssessorEditor
+    from textual.widgets import Select
+    async def scenario():
+        atomic(tmp_path / 'config.json', {'workers': 1, 'bands': ['4K+'], 'quota_path': str(tmp_path / 'quota'), 'observed_runs': []})
+        backend = Backend(tmp_path)
+        app = SwarmApp(backend)
+        async with app.run_test(size=(170, 60)) as pilot:
+            await pilot.pause()
+            await pilot.click('#worker-controls')
+            await pilot.pause()
+            assert isinstance(app.screen, CommandEditor)
+            app.screen.query_one('#command-scope', Select).value = 'all'
+            app.screen.query_one('#command-action', Select).value = 'stop_now'
+            app.screen.query_one('#command-cancel', Button).focus()
+            await pilot.press('enter')
+            await pilot.pause()
+            app.query_one(TabbedContent).active = 'queue-tab'
+            await pilot.pause()
+            app.query_one('#target-add', Button).focus()
+            await pilot.press('enter')
+            await pilot.pause()
+            assert isinstance(app.screen, TargetEditor)
+            app.screen.query_one('#target-address', Input).value = '0xea3d60'
+            app.screen.query_one('#target-size', Input).value = '14124'
+            app.screen.query_one('#target-profile', Select).value = 'default'
+            app.screen.query_one('#target-route', Select).value = 'exclusive'
+            app.screen.query_one('#target-save', Button).focus()
+            await pilot.press('enter')
+            await pilot.pause()
+            from native_swarm.state import read
+            assert read(tmp_path / 'routes.json')['0x00ea3d60']['mode'] == 'exclusive'
+            assert read(tmp_path / 'queue.json', [])[0]['immediate'] is True
+            app.query_one(TabbedContent).active = 'reports-tab'
+            await pilot.pause()
+            app.query_one('#assess', Button).focus()
+            await pilot.press('enter')
+            await pilot.pause()
+            assert isinstance(app.screen, AssessorEditor)
+            app.screen.query_one('#assessor-capacity', Input).value = '3'
+            app.screen.query_one('#assessor-cutoff', Input).value = '90'
+            # Disabled settings must not launch a model or reconstruction worker.
+            app.screen.query_one('#assessor-save', Button).focus()
+            await pilot.press('enter')
+            await pilot.pause()
+            assert backend.config['assessor']['capacity'] == 3
+            assert backend.config['assessor']['enabled'] is False
+            await pilot.press('ctrl+q')
+    asyncio.run(asyncio.wait_for(scenario(), timeout=25))

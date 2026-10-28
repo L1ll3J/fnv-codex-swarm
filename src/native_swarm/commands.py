@@ -1,0 +1,316 @@
+"""Durable operator commands, separate from worker-produced results."""
+
+import datetime as dt
+import hashlib
+from pathlib import Path
+import secrets
+import subprocess
+import sys
+
+from .state import atomic, read
+
+ACTIONS = ("stop_now", "finish_round", "handoff")
+TERMINAL = ("completed", "cancelled", "review_required")
+
+
+def now():
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def claim_path(state, value):
+    path = Path(value).resolve()
+    cfg = read(Path(state) / "config.json")
+    runs = {Path(r).resolve() for r in cfg.get("managed_runs", [])}
+    if path.parent.name != "claims" or path.parent.parent not in runs:
+        raise ValueError("Select a claim managed by this application.")
+    if not read(path / "claim.json"):
+        raise ValueError("Claim identity is missing.")
+    return path
+
+
+def cancel_executor(state, record):
+    """Supersede a command daemon through its exact, stable process identity."""
+    import os
+    import signal
+    import select
+
+    pid = read(Path(state) / "commands" / (record["id"] + ".launch.json")).get("pid")
+    if not pid:
+        return  # The claim lock and current command ID gate any late launch.
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return
+    try:
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        if (
+            b"native_swarm.command_worker" not in argv
+            or record["id"].encode() not in argv
+            or str(state).encode() not in argv
+        ):
+            # A recycled PID is not the command daemon and must not be signalled.
+            return
+        signal.pidfd_send_signal(fd, signal.SIGTERM)
+        if not select.select([fd], [], [], 15)[0]:
+            raise ValueError(
+                "Previous command is still finalizing; inspect it before superseding."
+            )
+    finally:
+        os.close(fd)
+
+
+def issue(
+    state,
+    claims,
+    action,
+    *,
+    replace=False,
+    handoff="improved",
+    timeout=45,
+    resume_admissions=True,
+):
+    from .backend import Backend
+
+    if action not in ACTIONS or handoff not in ("always", "improved", "never"):
+        raise ValueError("Choose a valid worker action and handoff policy.")
+    if type(timeout) is not int or not 1 <= timeout <= 600:
+        raise ValueError("Handoff timeout must be 1–600 seconds.")
+    state = Path(state)
+    requests = []
+    with Backend(state).locked():
+        paths = list(dict.fromkeys(claim_path(state, c) for c in claims))
+        if not paths:
+            raise ValueError("Select at least one worker or open claim.")
+        for claim in paths:
+            if not read(claim.parent.parent / "native-app-profile.json").get("id"):
+                raise ValueError("Managed profile identity is missing.")
+            current = read(claim / "operator-command.json")
+            if (
+                current
+                and current.get("state") not in TERMINAL
+                and action != "stop_now"
+            ):
+                raise ValueError(
+                    "A worker command is already in progress; Stop now can supersede it."
+                )
+            if action == "finish_round":
+                driver = (
+                    read(claim / "assignment.json")
+                    .get("checker_workflow", {})
+                    .get("driver_path")
+                )
+                if not driver or "block_new_batch" not in Path(driver).read_text():
+                    raise ValueError(
+                        "This older assignment lacks the round-boundary stop gate. Use Stop now or handoff; fresh assignments support Finish current round."
+                    )
+        reservations = read(state / "idle-reservations.json")
+        for claim in paths:
+            if read(claim / "giveup-response.json") or read(
+                claim / "submission-response.json"
+            ):
+                continue
+            current = read(claim / "operator-command.json")
+            if current and current.get("state") not in TERMINAL:
+                cancel_executor(state, current)
+                update(
+                    state,
+                    current,
+                    "cancelled",
+                    reason="Superseded by explicit Stop now.",
+                )
+            identifier = secrets.token_hex(12)
+            record = {
+                "id": identifier,
+                "claim": str(claim),
+                "action": action,
+                "replace": bool(replace),
+                "handoff": handoff,
+                "timeout": timeout,
+                "resume_admissions": resume_admissions,
+                "state": "requested",
+                "requested_at": now(),
+            }
+            retire(claim.parent.parent, claim.name)
+            profile = read(claim.parent.parent / "native-app-profile.json")["id"]
+            if replace:
+                reservations.pop(str(claim), None)
+            else:
+                reservations[str(claim)] = profile
+                record["idle_slot_reserved"] = True
+            from collections import Counter
+
+            atomic(state / "idle-reservations.json", reservations)
+            atomic(state / "idle-slots.json", dict(Counter(reservations.values())))
+            atomic(claim / "operator-command.json", record)
+            atomic(state / "commands" / (identifier + ".json"), record)
+            requests.append(record)
+        for record in requests:
+            with (state / "command-center.log").open("ab") as log:
+                try:
+                    proc = subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-m",
+                            "native_swarm.command_worker",
+                            str(state),
+                            record["id"],
+                        ],
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                    atomic(
+                        state / "commands" / (record["id"] + ".launch.json"),
+                        {"pid": proc.pid},
+                    )
+                except OSError as exc:
+                    update(
+                        state,
+                        record,
+                        "review_required",
+                        reason="Command launch failed: " + str(exc),
+                    )
+    return requests
+
+
+def update(state, record, phase, **details):
+    if phase != "review_required" and "reason" not in details:
+        record.pop("reason", None)
+    record.update(state=phase, updated_at=now(), **details)
+    atomic(Path(record["claim"]) / "operator-command.json", record)
+    atomic(Path(state) / "commands" / (record["id"] + ".json"), record)
+
+
+def block_new_batch(claim):
+    command = read(Path(claim) / "operator-command.json")
+    if command and command.get("state") != "cancelled":
+        raise RuntimeError(
+            "Operator stopped new candidate batches; preserve checked work."
+        )
+
+
+def block_new_check(claim):
+    command = read(Path(claim) / "operator-command.json")
+    if command.get("action") != "finish_round":
+        block_new_batch(claim)
+
+
+def operator_retiring(run):
+    """Recognize only operator-originated retirement, never another saved failure."""
+    run = Path(run)
+    stop = (
+        (run / "STOP_NEW_CLAIMS").read_text().strip()
+        if (run / "STOP_NEW_CLAIMS").exists()
+        else ""
+    )
+    marker = read(run / "operator-retiring.json")
+    if not marker:
+        return (run / "operator-drain.json").exists() and (
+            not stop
+            or stop
+            == "Rolling executor stopped: Operator requested a safe drain; no new or replacement workers"
+        )
+    if not stop:
+        return True
+    if (
+        marker.get("acknowledged_stop_sha256")
+        == hashlib.sha256(stop.encode()).hexdigest()
+    ):
+        return True
+    return (
+        stop == "Rolling executor stopped: direct Codex process exited nonzero"
+        and any(
+            read(run / "claims" / c / "operator-command.json").get("state")
+            in (
+                "stopping",
+                "evidence_preserved",
+                "releasing",
+                "completed",
+                "review_required",
+            )
+            for c in marker.get("claims", [])
+        )
+    )
+
+
+def retire(run, claim=None, *, acknowledge=False):
+    run = Path(run)
+    record = read(run / "operator-retiring.json")
+    claims = record.get("claims", [])
+    if claim and claim not in claims:
+        claims.append(claim)
+    record.update(claims=claims, requested_at=now())
+    if acknowledge and (run / "STOP_NEW_CLAIMS").exists():
+        record["acknowledged_stop_sha256"] = hashlib.sha256(
+            (run / "STOP_NEW_CLAIMS").read_text().strip().encode()
+        ).hexdigest()
+    atomic(run / "operator-retiring.json", record)
+    atomic(run / "operator-drain.json", {"source": "operator-retirement", "at": now()})
+    atomic(
+        run / "operator-admissions-paused.json",
+        {"source": "operator-retirement", "at": now()},
+    )
+
+
+def retry(state, value):
+    """Explicit operator retry: archive the uncertain intent, then recheck ownership."""
+    from .backend import Backend
+
+    state = Path(state)
+    claim = claim_path(state, value)
+    with Backend(state).locked():
+        record = read(claim / "operator-command.json")
+        if not record or record.get("state") in ("completed", "cancelled"):
+            raise ValueError("Select an unfinished command to reconcile.")
+        cancel_executor(state, record)
+        # The daemon holds this lock throughout dispatch. Never retry a live request.
+        import fcntl
+
+        with (claim / ".operator-command.lock").open("a") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ValueError(
+                    "The command is still running; wait for it to finish."
+                ) from exc
+            for name in ("operator-release-intent.json", "operator-submit-intent.json"):
+                intent = claim / name
+                if intent.exists():
+                    archive = (
+                        claim
+                        / "operator-release-history"
+                        / (
+                            name
+                            + "-"
+                            + record["id"]
+                            + "-"
+                            + secrets.token_hex(6)
+                            + ".json"
+                        )
+                    )
+                    archive.parent.mkdir(parents=True, exist_ok=True)
+                    intent.replace(archive)
+            record["state"] = "requested"
+            update(state, record, "requested", retry_authorized_at=now())
+            with (state / "command-center.log").open("ab") as log:
+                try:
+                    proc = subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-m",
+                            "native_swarm.command_worker",
+                            str(state),
+                            record["id"],
+                        ],
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                    atomic(
+                        state / "commands" / (record["id"] + ".launch.json"),
+                        {"pid": proc.pid},
+                    )
+                except OSError as exc:
+                    update(state, record, "review_required", reason=str(exc))
+                    raise
+    return "Explicit reconciliation queued; ownership will be checked before any release retry."

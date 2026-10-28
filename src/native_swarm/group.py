@@ -219,6 +219,7 @@ def run(root, claim_id):
     assignment_path = claim / "assignment.json"
     assignment = read(assignment_path)
     profile = read(root / "native-app-profile.json")
+    isolated = profile.get("team_mode", "collaborative") == "isolated"
     directory = claim / "collaboration"
     directory.mkdir(exist_ok=True)
     # No supervisor relaunch on an ambiguous process-start window.
@@ -235,6 +236,7 @@ def run(root, claim_id):
         "model": assignment["model"],
         "effort": assignment["reasoning_effort"],
         "members": [],
+        "isolated": isolated,
         "state": "running",
     }
     atomic(directory / "group.json", manifest)
@@ -310,9 +312,12 @@ def run(root, claim_id):
         atomic(directory / "group.json", manifest)
         err = (workspace / "stderr.log").open("ab")
         files.append(err)
+        argv = peer_command(root, assignment, thread)
+        if isolated:
+            argv[argv.index("-C") + 1] = str(workspace)
         proc = subprocess.Popen(
-            peer_command(root, assignment, thread),
-            cwd=root,
+            argv,
+            cwd=workspace if isolated else root,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=err,
@@ -353,6 +358,11 @@ def run(root, claim_id):
                 "board_command": f"{sys.executable} -m native_swarm.board --assignment {member_path}",
                 "shared_checker": f"{sys.executable} -m native_swarm.group_check --assignment {member_path}",
             }
+            if isolated:
+                data["collaboration"]["isolated"] = True
+                data["collaboration"].pop("shared_paths", None)
+                data["collaboration"].pop("board", None)
+                data["collaboration"].pop("board_command", None)
             data["checker_workflow"] = dict(assignment["checker_workflow"])
             command = data["collaboration"]["shared_checker"]
             from . import group_check
@@ -367,10 +377,18 @@ def run(root, claim_id):
                 + ' --finish CHECK_MANIFEST_JSON --residual "concise residual issue"',
             )
             atomic(member_path, data)
+            visible = dict(data)
+            if isolated:
+                visible.pop("collaboration", None)
+                visible["member_budget"] = {
+                    "member": member_id,
+                    "budget_mode": assignment.get("budget_mode", "shared"),
+                    "members": profile["group_size"],
+                }
             prompt = (
                 (root / "worker-contract.xml").read_bytes()
                 + b"\nASSIGNMENT JSON\n"
-                + member_path.read_bytes()
+                + json.dumps(visible).encode()
             )
             prompt_path = workspace / "cli-prompt.txt"
             prompt_path.write_bytes(prompt)
@@ -645,6 +663,17 @@ def audit_group(claim):
         str(path.resolve())
         for path in (claim / "work/recorded-checks").glob("check-*.json")
     }
+    if state.get("isolated"):
+        for path in (directory / "private-receipts").glob("*.json"):
+            value = read(path)
+            attributed.update(
+                resolve_receipt(p) for p in value.get("reused_receipts", {}).values()
+            )
+            attributed.update(
+                resolve_receipt(row["manifest"])
+                for row in value.get("batch", {}).get("results", [])
+                if not row.get("reused")
+            )
     if actual != attributed:
         raise ValueError("Group check receipts are missing shared-board provenance.")
     usage = {

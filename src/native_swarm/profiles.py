@@ -34,6 +34,7 @@ def default_profile(workers=10, bands=None):
         "priority": "random",
         "queue_first": True,
         "group_size": 1,
+        "team_mode": "collaborative",
         "bands": list(BANDS if bands is None else bands),
         "rounds": 20,
         "budget_mode": "shared",
@@ -81,8 +82,10 @@ def validate_profiles(profiles, capacity=10):
             raise ValueError(
                 "Concurrent functions must be 0–75 per profile (native controller limit); use multiple profiles for more. Zero leaves the profile unallocated."
             )
-        if type(p.get("group_size")) is not int or not 1 <= p["group_size"] <= 4:
-            raise ValueError("Agents per function must be 1–4.")
+        if type(p.get("group_size")) is not int or p["group_size"] < 1:
+            raise ValueError("Agents per function must be a positive whole number.")
+        if p.get("team_mode", "collaborative") not in ("collaborative", "isolated"):
+            raise ValueError("Choose collaborative or isolated execution.")
         if type(p.get("queue_first")) is not bool:
             raise ValueError("Queue preference must be on or off.")
         from .budgets import validate

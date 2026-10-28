@@ -73,6 +73,7 @@ class Projection:
                 controllers.append(
                     {
                         "run": run.name,
+                        "run_path": str(run),
                         "handover": self.load(
                             run / "operator-profile-handover-pending.json"
                         ),
@@ -115,7 +116,13 @@ class Projection:
                         else "verification pending"
                     )
                 elif released:
-                    state = "released"
+                    state = (
+                        "closed remotely"
+                        if self.load(claim / "giveup-response.json").get(
+                            "observed_closed"
+                        )
+                        else "released"
+                    )
                 elif alive:
                     state = "working"
                 elif result.get("match"):
@@ -215,6 +222,13 @@ class Projection:
                 from .group_accounting import totals
 
                 group_totals = totals(claim, usage) if group else None
+                command = self.load(claim / "operator-command.json")
+                if (
+                    not (submission or released)
+                    and command
+                    and command.get("state") not in ("completed", "cancelled")
+                ):
+                    state = "operator " + command.get("state", "requested")
                 row = {
                     "official_tools_id": assignment.get("official_tools", {}).get("id"),
                     "model": assignment.get("model", "unknown"),
@@ -230,6 +244,7 @@ class Projection:
                     "id": str(claim),
                     "claim_id": claim.name,
                     "run": run.name,
+                    "run_path": str(run),
                     "address": c.get("address", "?"),
                     "bytes": c.get("size"),
                     "state": state,
@@ -252,6 +267,7 @@ class Projection:
                     if "review" in str(job.get("state"))
                     else "",
                     "residual": result.get("residual_issue", ""),
+                    "command": command,
                     "worker": job.get("worker"),
                     "pid": pid,
                     "stop": (run / "STOP_NEW_CLAIMS").read_text()

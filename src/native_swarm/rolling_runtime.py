@@ -6,6 +6,11 @@ from .runtime import replace_once
 def configure_batch(path):
     replace_once(
         path,
+        "        path=rounds/(batch_id+'.json')",
+        "        from native_swarm.commands import block_new_batch\n        block_new_batch(claim)\n        path=rounds/(batch_id+'.json')",
+    )
+    replace_once(
+        path,
         "assignment['max_batch_rounds'],'Assigned batch-round budget exhausted'",
         "__import__('native_swarm.budgets',fromlist=['effective_limits']).effective_limits(claim,assignment)['max_batch_rounds'],'Assigned batch-round budget exhausted'",
     )
@@ -17,6 +22,11 @@ def configure_batch(path):
 
 
 def configure_recorder(path):
+    replace_once(
+        path,
+        "  assert args.candidate is not None,",
+        "  from native_swarm.commands import block_new_check\n  block_new_check(claim)\n  assert args.candidate is not None,",
+    )
     replace_once(
         path,
         "  limit=assignment.get('max_compiler_invocations',assignment['max_plain_checks'])",

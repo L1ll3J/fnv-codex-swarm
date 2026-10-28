@@ -120,17 +120,13 @@ def decision(root, now=None):
         owners[wanted["id"]] = (root, wanted)
     profiles = [value[1] for value in owners.values()]
     allocation = targets(profiles, result["fraction"])
-    from .assessment import requested
-
-    if requested(state):
-        # Release a future physical slot; never kill an admitted assignment.
-        physical = sum(allocation[p["id"]] * p.get("group_size", 1) for p in profiles)
-        for p in sorted(profiles, key=lambda p: (p.get("group_size", 1), p["id"])):
-            if physical <= cfg.get("worker_capacity", 10) - 1:
-                break
-            if allocation[p["id"]]:
-                allocation[p["id"]] -= 1
-                physical -= p.get("group_size", 1)
+    idle = read(state / "idle-slots.json")
+    for identifier in allocation:
+        allocation[identifier] = max(
+            0, allocation[identifier] - idle.get(identifier, 0)
+        )
+        if identifier in cfg.get("paused_profiles", []):
+            allocation[identifier] = 0
     owner = owners.get(profile["id"])
     result["target"] = (
         allocation.get(profile["id"], 0) if owner and owner[0] == root else 0

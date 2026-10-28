@@ -281,7 +281,7 @@ def test_resume_keeps_protected_stop_and_reports_actual_reason(tmp_path, monkeyp
     create.assert_not_called()
 
 
-def test_resume_keeps_operator_drain_and_does_not_start_new_profiles(
+def test_resume_replaces_operator_drained_generation_without_clearing_drain(
     tmp_path, monkeypatch
 ):
     import pytest
@@ -291,10 +291,11 @@ def test_resume_keeps_operator_drain_and_does_not_start_new_profiles(
     atomic(sol / "operator-drain.json", {"reason": "Finish the current run"})
     create = Mock()
     monkeypatch.setattr(b, "create_run", create)
-    with pytest.raises(ControlError, match="Finish the current run"):
-        b.start()
-    assert read(sol / "operator-drain.json")["reason"] == "Finish the current run"
-    create.assert_not_called()
+    assert "started" in b.start()
+    assert create.call_count == 1
+    assert (sol / "operator-drain.json").exists()
+    assert read(sol / "operator-admissions-paused.json")["source"] == "operator-retirement"
+
 
 
 def test_resume_checks_capacity_before_creating_missing_profile(tmp_path, monkeypatch):

@@ -108,7 +108,7 @@ def test_copied_batch_recorder_and_final_audit_guards_use_derived_limits(
     batch(tmp_path, 4, improved=True, events=events)
     path = tmp_path / "batch.py"
     path.write_text(
-        "assert 5<assignment['max_batch_rounds'],'Assigned batch-round budget exhausted'\nbatch={'identity':identity,'batch_id':batch_id,}\n"
+        "if True:\n    if True:\n        path=rounds/(batch_id+'.json')\nassert 5<assignment['max_batch_rounds'],'Assigned batch-round budget exhausted'\nbatch={'identity':identity,'batch_id':batch_id,}\n"
     )
     configure_batch(path)
     scope = {
@@ -121,7 +121,7 @@ def test_copied_batch_recorder_and_final_audit_guards_use_derived_limits(
     scope.update(runpy.run_path(str(path), init_globals=scope))
     assert scope["batch"]["round_number"] == 2
     path.write_text(
-        "def admission():\n  limit=assignment.get('max_compiler_invocations',assignment['max_plain_checks'])\n  assert len(prior)<assignment['max_plain_checks']\n  return limit\n"
+        "def checker():\n  assert args.candidate is not None, 'candidate required'\ndef admission():\n  limit=assignment.get('max_compiler_invocations',assignment['max_plain_checks'])\n  assert len(prior)<assignment['max_plain_checks']\n  return limit\n"
     )
     configure_recorder(path)
     scope.update(prior=[None] * 40)

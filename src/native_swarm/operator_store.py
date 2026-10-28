@@ -132,7 +132,9 @@ class OperatorStore:
             atomic(self.state / "queue.json", q)
         return item
 
-    def reserve(self, profile_id, worker, *, eligible=None):
+    def reserve(self, profile_id, worker, *, eligible=None, queue_enabled=True):
+        from .routing import allowed
+
         with self.locked():
             q = self.queue()
             item = next(
@@ -141,6 +143,8 @@ class OperatorStore:
                     for x in q
                     if x["state"] == "queued"
                     and x.get("profile_id") in (None, profile_id)
+                    and (queue_enabled or x.get("immediate", False))
+                    and allowed(self.state, x["target"]["address"], profile_id)
                     and (eligible is None or eligible(x["target"]))
                 ),
                 None,
