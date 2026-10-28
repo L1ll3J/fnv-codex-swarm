@@ -45,12 +45,36 @@ class ManagedExecutor(RandomExecutor):
         return super().resume_prepared()
 
     def try_launch_prepared(self, worker):
-        if not (self.root / "operator-drain.json").exists():
-            return super().try_launch_prepared(worker)
         from native_swarm.drain import release_unlaunched
 
-        release_unlaunched(self, worker)
-        return False
+        if (self.root / "operator-drain.json").exists():
+            release_unlaunched(self, worker)
+            return False
+        state_dir = read_json(self.root / "native-app-managed.json", {}).get(
+            "state_dir"
+        )
+        if state_dir:
+            from native_swarm.allocation import selected_profile
+            from native_swarm.group_check import locked
+
+            state = Path(state_dir)
+            # Order closure against both profile edits/claim dispatch and launch.
+            # Only this controller writes its journal or closes its own claim.
+            with locked(state / "allocation.lock"), locked(state / "capacity.lock"):
+                wanted = selected_profile(
+                    self.root, read_json(state / "config.json", {})
+                )
+                withdrawn = wanted is None or wanted.get("instances", 0) == 0
+                pause = read_json(self.root / "operator-admissions-paused.json", {})
+                if withdrawn and pause.get("source") == "profile-allocation":
+                    if not (self.root / "STOP_NEW_CLAIMS").exists():
+                        release_unlaunched(
+                            self,
+                            worker,
+                            reason="Profile allocation changed before worker launch; local assignment preserved.",
+                        )
+                    return False
+        return super().try_launch_prepared(worker)
 
     def prepare_assignment(self, worker, band, token, log_path):
         from native_swarm.operator_store import OperatorStore
@@ -136,11 +160,11 @@ class ManagedExecutor(RandomExecutor):
             if item:
                 store.update(
                     item["id"],
-                    "queued"
-                    if withdrawn
-                    else "unavailable"
-                    if definite
-                    else "review_required",
+                    (
+                        "queued"
+                        if withdrawn
+                        else "unavailable" if definite else "review_required"
+                    ),
                     log=str(log_path),
                 )
             if definite and extra:
@@ -169,9 +193,9 @@ class ManagedExecutor(RandomExecutor):
                 or len(self.active) >= value["target"]
                 or (self.root / "operator-admissions-paused.json").exists()
             ):
-                self.journal["jobs"][worker]["state"] = (
-                    "prepared_waiting_transient_gate"
-                )
+                self.journal["jobs"][worker][
+                    "state"
+                ] = "prepared_waiting_transient_gate"
                 self.journal_save()
                 return False
             if occupied(cfg, state) + read_json(

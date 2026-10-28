@@ -231,7 +231,7 @@ class SwarmApp(App):
                         id="bands",
                     )
                     yield Static(
-                        "Model, reasoning, priority and per-profile brackets are under Worker profiles.\n20 rounds/function · 1–8 candidates/round\nUsage policy applies to controllers created by this release. Older/imported controllers retain their policy until drained.\nPreviously attempted functions are eligible. Original checker and submission gates stay in place.",
+                        "Model, reasoning, priority and per-profile brackets are under Worker profiles.\nProfile-defined rounds and optional rolling improvement window · 1–8 candidates/round\nUsage policy applies to controllers created by this release. Older/imported controllers retain their policy until drained.\nPreviously attempted functions are eligible. Original checker and submission gates stay in place.",
                         markup=False,
                     )
                     policy = {**DEFAULT_POLICY, **cfg.get("usage_policy", {})}
@@ -294,6 +294,7 @@ class SwarmApp(App):
             "Queue first",
             "Rounds",
             "Budget",
+            "Rolling window",
         )
         self.query_one("#queue", DataTable).add_columns(
             "Function", "Bytes", "Historical diff", "Profile", "State"
@@ -363,12 +364,23 @@ class SwarmApp(App):
             if tools
             else ""
         )
+        handover_block = next(
+            (
+                controller["handover"].get("reason", "Profile handover requires review")
+                for controller in reversed(data.get("controllers", []))
+                if controller.get("alive")
+                and controller.get("handover", {}).get("state")
+                in ("blocked", "review_required")
+            ),
+            None,
+        )
         self.query_one("#summary", Static).update(
             f"{data['running']} workers running  ·  {data['open']} unresolved claims  ·  {data['verified']} verified  ·  {data['pending']} pending\nUsage: {display(used)}% used (observed {age} ago) / {policy['cutoff_used_percent']}% cutoff · {MODES.get(policy['mode'], 'invalid policy')} · API-equivalent cost ≥ ${cost:.2f}{tool_status}"
             + (
                 "\nController: "
                 + (
-                    data["controllers"][-1]["stop"]
+                    handover_block
+                    or data["controllers"][-1]["stop"]
                     or (
                         "running / preparing assignments"
                         if data["controllers"][-1]["alive"]
@@ -513,6 +525,9 @@ class SwarmApp(App):
                         "yes" if p["queue_first"] else "no",
                         str(p.get("rounds", 20)),
                         p.get("budget_mode", "shared"),
+                        str(p.get("improvement_window", 3)) + " rounds"
+                        if p.get("extend_while_improving", True)
+                        else "off",
                     ],
                 )
                 for p in self.profile_drafts

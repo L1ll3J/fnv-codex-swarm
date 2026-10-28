@@ -51,7 +51,7 @@ def test_lease_does_not_imply_running_and_failed_checks_do_not_improve_best(tmp_
         and row["state"] == "open claim / no worker"
     )
     assert row["best"] == 7 and row["checks_since_best"] == 1
-    assert [x["to"] for x in row["best_history"]] == [15, 7]
+    assert [x["to"] for x in row["best_history"]] == [7]
 
 
 def test_local_match_pending_and_verified_are_different(tmp_path):
@@ -105,3 +105,45 @@ def test_preparation_failure_is_visible_even_before_any_claim(tmp_path):
     s = Projection().snapshot([r], tmp_path / "q")
     assert not s["rows"]
     assert s["controllers"][0]["stop"] == "assignment preparation failed"
+
+
+def test_review_row_explains_actual_supervisor_failure(tmp_path):
+    r, p = fixture(tmp_path)
+    atomic(
+        r / "rolling-executor/journal.json",
+        {
+            "jobs": {
+                "w": {
+                    "worker": "w",
+                    "claim_id": "c",
+                    "state": "failed_review_required",
+                    "pid": 99999999,
+                }
+            },
+        },
+    )
+    atomic(
+        p / "session/state.json",
+        {
+            "state": "review_required",
+            "streams_closed": True,
+            "error": "Provider capacity retries exhausted; evidence preserved",
+        },
+    )
+    row = Projection().snapshot([r], tmp_path / "q")["rows"][0]
+    assert row["error"] == "Provider capacity retries exhausted; evidence preserved"
+
+
+def test_blocked_profile_handover_reason_is_projected(tmp_path):
+    r = tmp_path / "run"
+    atomic(r / "native-app-managed.json", {"state_dir": str(tmp_path)})
+    atomic(
+        r / "operator-profile-handover-pending.json",
+        {
+            "state": "blocked",
+            "reason": "Drain safely, then Start / Resume",
+        },
+    )
+    value = Projection().snapshot([r], tmp_path / "q")["controllers"][0]
+    assert value["handover"]["state"] == "blocked"
+    assert value["handover"]["reason"] == "Drain safely, then Start / Resume"

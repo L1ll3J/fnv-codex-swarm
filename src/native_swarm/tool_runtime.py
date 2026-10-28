@@ -76,6 +76,10 @@ def configure(root):
         "'schema':'fnv-recorded-check/2'",
         "'schema':'fnv-recorded-check/2','official_tools_id':assignment.get('official_tools',{}).get('id'),'compiler_toolchains':tool_context.get('toolchains',{}) if tool_context else {}",
     )
+    from .rolling_runtime import configure_recorder, configure_evidence
+
+    configure_recorder(recorder)
+    configure_evidence(root / "evidence.py")
     # Recorder wrappers must bind to the actual copied, adapted recorder.
     import hashlib
 

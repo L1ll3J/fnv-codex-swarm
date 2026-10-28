@@ -82,9 +82,11 @@ class Backend:
                 )
             policy = validate_policy(usage_policy or cfg.get("usage_policy"))
             cfg.update(
-                workers=validate_profiles(cfg["profiles"], capacity)
-                if cfg.get("profiles")
-                else workers,
+                workers=(
+                    validate_profiles(cfg["profiles"], capacity)
+                    if cfg.get("profiles")
+                    else workers
+                ),
                 bands=bands,
                 usage_policy=policy,
                 worker_capacity=capacity,
@@ -115,6 +117,7 @@ class Backend:
 
     def save_profiles(self, profiles, *, expected=None):
         known = {p["id"] for p in profiles}
+        handovers = []
         from .group_check import locked
         from .allocation import sync
 
@@ -147,21 +150,50 @@ class Backend:
                 selected = by_id.get(active.get("id"))
                 if (run / "native-app-managed.json").exists():
                     sync(run, cfg)
+                    from .allocation import selected_profile
+
+                    if (
+                        selected
+                        and selected["instances"] > 0
+                        and selected_profile(run, cfg) is None
+                        and process_alive(
+                            read(run / ".rolling-executor-owner.json").get("pid"), run
+                        )
+                        and not (run / "STOP_NEW_CLAIMS").exists()
+                        and not (run / "operator-drain.json").exists()
+                        and read(run / "operator-admissions-paused.json").get("source")
+                        == "profile-allocation"
+                    ):
+                        handovers.append(run)
                 if selected:
                     control = read(run / "operator-control.json")
                     control["native_app_selection"] = {
-                        key: selected.get(key, 20 if key == "rounds" else "shared")
+                        key: selected.get(
+                            key,
+                            {
+                                "rounds": 20,
+                                "budget_mode": "shared",
+                                "extend_while_improving": True,
+                                "improvement_window": 3,
+                            }.get(key),
+                        )
                         for key in (
                             "priority",
                             "queue_first",
                             "bands",
                             "rounds",
                             "budget_mode",
+                            "extend_while_improving",
+                            "improvement_window",
                         )
                     }
                     control["native_app_bands"] = selected["bands"]
                     atomic(run / "operator-control.json", control)
-        return "Allocation and selection saved for future admissions. Current tasks finish normally. Model, reasoning and team-size changes require fresh controllers."
+        from .handover_watch import request
+
+        for run in handovers:
+            request(run, self.state)
+        return "Allocation and selection saved. Current tasks finish normally; changed profiles hand over automatically after their work closes."
 
     def prompt(self, group=False):
         default = (
@@ -322,15 +354,30 @@ class Backend:
                 profiles = [p for p in profiles if p["instances"] > 0]
                 by_id = {p["id"]: p for p in profiles}
                 represented = set()
+                retired = []
+                pending = []
                 for run in active:
                     running = read(run / "native-app-profile.json")
                     wanted = selected_profile(run, cfg)
                     if running.get("id") in by_id and wanted is None:
-                        raise ControlError(
-                            f"Profile {running['id']} has an active controller with different "
-                            "model, reasoning or team size. Its current tasks must finish "
-                            "and its controller must stop before starting the replacement."
-                        )
+                        from .handover import idle_reason, retire_idle
+
+                        if idle_reason(run):
+                            from .handover_watch import request
+
+                            request(run, self.state, control_locked=True)
+                            represented.add(running["id"])
+                            pending.append(run)
+                            continue
+                        try:
+                            retire_idle(run, self.state)
+                        except RuntimeError as exc:
+                            raise ControlError(
+                                f"Profile {running['id']} is waiting for its existing work "
+                                f"before handover: {exc}"
+                            ) from exc
+                        retired.append(run)
+                        continue
                     if wanted and wanted["instances"] > 0:
                         if wanted["id"] in represented:
                             raise ControlError(
@@ -338,6 +385,7 @@ class Backend:
                                 "resolve their ownership before resuming."
                             )
                         represented.add(wanted["id"])
+                active = [run for run in active if run not in retired]
                 missing = [p for p in profiles if p["id"] not in represented]
                 if missing:
                     # Never replace a controller that lost ownership while its
@@ -356,7 +404,9 @@ class Backend:
                             )
                     template = Path(cfg["template_run"])
                     self.verify_template(template, cfg)
-                account = self.preflight(active[0], require_idle=False)
+                account = self.preflight(
+                    active[0] if active else template, require_idle=False
+                )
                 created = []
                 try:
                     for profile in missing:
@@ -366,7 +416,10 @@ class Backend:
                     for run in created:
                         atomic(
                             run / "operator-admissions-paused.json",
-                            {"requested_at": self.now(), "reason": "profile start incomplete"},
+                            {
+                                "requested_at": self.now(),
+                                "reason": "profile start incomplete",
+                            },
                         )
                     raise
                 for run in active:
@@ -379,6 +432,11 @@ class Backend:
                 (self.state / "assessment-admissions-paused.json").unlink(
                     missing_ok=True
                 )
+                if pending:
+                    return (
+                        f"Admissions resumed; {len(pending)} profile handover(s) will finish "
+                        "automatically after their current work closes."
+                    )
                 return (
                     f"Admissions resumed; started {len(created)} new profile controller(s). "
                     "Existing workers keep running under the saved allocations and total capacity."
@@ -554,6 +612,7 @@ class Backend:
                 "usage_policy_version": 1,
                 "supervision_version": 2,
                 "allocation_version": 1,
+                "withdrawn_preparation_closure_version": 1,
                 "toolchain_version": 1,
             },
         )

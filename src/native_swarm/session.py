@@ -1,6 +1,7 @@
 """Same-thread continuation beneath the native scheduler's original lease/budget."""
 
 import datetime as dt
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -40,12 +41,16 @@ def due_expired_claims(root, *args, **kwargs):
 
 
 def remaining(claim, assignment):
+    from .budgets import effective_limits
+
     value = status(claim)
+    limits = effective_limits(claim, assignment)
     return (
         value["rounds_remaining"] > 0
-        and value["checks"] < assignment.get("max_plain_checks", 160)
-        and value["compiler_invocations_upper_bound"] + assignment.get("official_internal_retry_bound", 4)
-        <= assignment.get("max_compiler_invocations", 640)
+        and value["checks"] < limits["max_plain_checks"]
+        and value["compiler_invocations_upper_bound"]
+        + assignment.get("official_internal_retry_bound", 4)
+        <= limits["max_compiler_invocations"]
     )
 
 
@@ -74,6 +79,48 @@ def command(root, assignment, thread=None):
         "--json",
     ]
     return argv + (["resume", thread, "-"] if thread else ["-"])
+
+
+def transient_capacity(events):
+    """Recognize provider failures without treating tool output as instructions."""
+    errors = []
+    commands = set()
+    for event in events:
+        kind = event.get("type")
+        item = event.get("item", {})
+        if item.get("type") == "command_execution":
+            if kind == "item.started":
+                commands.add(item.get("id"))
+            elif kind == "item.completed":
+                commands.discard(item.get("id"))
+        if rejection_event(event):
+            return False
+        if kind in ("error", "turn.failed"):
+            errors.append(
+                event.get("message") or event.get("error", {}).get("message", "")
+            )
+    return (
+        bool(errors)
+        and not commands
+        and all(
+            "429 Too Many Requests" in message
+            or "Selected model is at capacity" in message
+            for message in errors
+        )
+    )
+
+
+def incomplete_dispatch(claim):
+    records = claim / "work/recorded-checks"
+    if len(list(records.glob("candidate-*.cpp"))) > len(
+        list(records.glob("check-*.json"))
+    ):
+        return True
+    for path in (claim / "work/batch-rounds").glob("*.json"):
+        pending = read(path).get("pending")
+        if pending and not Path(pending["record"]).is_file():
+            return True
+    return False
 
 
 def run_turn(root, claim, assignment, directory, state, turn, prompt, stop, deadline):
@@ -154,39 +201,101 @@ def run_turn(root, claim, assignment, directory, state, turn, prompt, stop, dead
             and not rejected
             and not stream_errors
             and proc.returncode == 1
-            and not list((claim / "work/recorded-checks").glob("check-*.json"))
-            and bool(events)
-            and all(
-                e.get("type")
-                in ("thread.started", "turn.started", "error", "turn.failed")
-                for e in events
-            )
-            and any(
-                "429 Too Many Requests" in e.get("message", "")
-                or "Selected model is at capacity" in e.get("message", "")
-                for e in events
-            )
+            and transient_capacity(events)
+            and len(set(ids)) == 1
+            and not incomplete_dispatch(claim)
         )
         return ids, proc.returncode, normal, capacity
 
 
-def run(root, claim_id, prompt):
+def recovery_state(root, claim):
+    """Recover only a dead, fully observed provider-capacity failure."""
+    directory = claim / "session"
+    state = read(directory / "state.json")
+    if (
+        state.get("state") != "review_required"
+        or state.get("streams_closed") is not True
+    ):
+        raise ValueError("Only a closed failed supervisor can be recovered")
+    if state.get("capacity_retries", 0) >= 5:
+        raise ValueError("Provider retry allowance exhausted")
+    turns = state.get("turns", [])
+    if not turns or state.get("deadline", 0) <= time.time():
+        raise ValueError("Original session deadline has expired or is missing")
+    for pid in (
+        read(directory / "launch-intent.json").get("pid"),
+        turns[-1].get("pid"),
+    ):
+        if type(pid) is not int or pid <= 0:
+            raise ValueError("Original process identity is missing")
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise ValueError("Original supervisor or turn process is still alive")
+    events = [
+        json.loads(line)
+        for line in (directory / f"turn-{turns[-1]['number']:03d}.jsonl")
+        .read_text()
+        .splitlines()
+        if line.strip()
+    ]
+    ids = {
+        event.get("thread_id") or event.get("thread", {}).get("id")
+        for event in events
+        if event.get("type") == "thread.started"
+    }
+    if (
+        len(ids) != 1
+        or not next(iter(ids))
+        or (state.get("thread_id") and state["thread_id"] not in ids)
+    ):
+        raise ValueError("A single consistent existing model thread is required")
+    if turns[-1].get("exit_code") != 1 or not transient_capacity(events):
+        raise ValueError(
+            "The saved failure is not a recognized provider capacity error"
+        )
+    if (
+        incomplete_dispatch(claim)
+        or member_rejection(claim / "work")
+        or (root / "approval-blocker-current.json").exists()
+    ):
+        raise ValueError("Uncertain dispatch or approval stop requires review")
+    state["thread_id"] = next(iter(ids))
+    return state
+
+
+def run(root, claim_id, prompt, recover=False):
+    directory = Path(root).resolve() / "claims" / claim_id / "session"
+    directory.mkdir(exist_ok=True)
+    with (directory / "supervisor.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return _run(root, claim_id, prompt, recover=recover)
+
+
+def _run(root, claim_id, prompt, recover=False):
     root = Path(root).resolve()
     claim = root / "claims" / claim_id
     assignment = read(claim / "assignment.json")
     directory = claim / "session"
     directory.mkdir(exist_ok=True)
-    # Exclusive creation prevents replay after an ambiguous supervisor launch.
-    with (directory / "launch-intent.json").open("x") as output:
-        json.dump({"pid": os.getpid(), "at": time.time()}, output)
-        output.flush()
-        os.fsync(output.fileno())
-    state = {
-        "state": "running",
-        "turns": [],
-        "thread_id": None,
-        "streams_closed": False,
-    }
+    if recover:
+        state = recovery_state(root, claim)
+        atomic(directory / f"recovery-{len(state['turns']):03d}.json", state)
+        state.update(state="running", recovered_at=time.time())
+    else:
+        # Exclusive creation prevents replay after an ambiguous supervisor launch.
+        with (directory / "launch-intent.json").open("x") as output:
+            json.dump({"pid": os.getpid(), "at": time.time()}, output)
+            output.flush()
+            os.fsync(output.fileno())
+        state = {
+            "state": "running",
+            "turns": [],
+            "thread_id": None,
+            "streams_closed": False,
+        }
     atomic(directory / "state.json", state)
     stop = threading.Event()
     previous_handlers = {
@@ -203,6 +312,7 @@ def run(root, claim_id, prompt):
             deadline,
             dt.datetime.fromisoformat(expires.replace("Z", "+00:00")).timestamp() - 305,
         )
+    deadline = min(state["deadline"], deadline) if recover else deadline
     state["deadline"] = deadline
     try:
         while time.time() < deadline and not stop.is_set():
@@ -227,10 +337,36 @@ def run(root, claim_id, prompt):
             ids, exit_code, normal, capacity = run_turn(
                 root, claim, assignment, directory, state, turn, prompt, stop, deadline
             )
-            if capacity and len(state["turns"]) == 1:
-                state.update(state="review_required", capacity_retryable=True)
-                return 1
-            if not normal or (state["thread_id"] and ids[0] != state["thread_id"]):
+            consistent_thread = len(set(ids)) == 1 and (
+                not state["thread_id"] or ids[0] == state["thread_id"]
+            )
+            if consistent_thread:
+                state["thread_id"] = ids[0]
+                atomic(directory / "state.json", state)
+            if capacity and consistent_thread:
+                retries = state.get("capacity_retries", 0)
+                if stop.is_set() or incomplete_dispatch(claim):
+                    raise RuntimeError(
+                        "Uncertain or stopped dispatch retained; no capacity retry"
+                    )
+                if any(
+                    score(path)[0] == 0
+                    for path in (claim / "work/recorded-checks").glob("check-*.json")
+                ) or not remaining(claim, assignment):
+                    break
+                if retries >= 5:
+                    raise RuntimeError(
+                        "Provider capacity retry limit reached; same session preserved"
+                    )
+                archive_results(claim, directory / f"capacity-{turn['number']:03d}")
+                delay = min(60, 15 * (2**retries), max(0, deadline - time.time()))
+                state.update(
+                    capacity_retries=retries + 1, retry_after=time.time() + delay
+                )
+                atomic(directory / "state.json", state)
+                stop.wait(delay)
+                continue
+            if not normal or not consistent_thread:
                 raise RuntimeError(
                     "Worker did not complete an ordinary successful turn; review retained"
                 )
@@ -292,4 +428,11 @@ def run(root, claim_id, prompt):
 
 
 if __name__ == "__main__":
-    raise SystemExit(run(sys.argv[1], sys.argv[2], sys.stdin.buffer.read()))
+    raise SystemExit(
+        run(
+            sys.argv[1],
+            sys.argv[2],
+            b"" if "--recover" in sys.argv[3:] else sys.stdin.buffer.read(),
+            recover="--recover" in sys.argv[3:],
+        )
+    )

@@ -10,6 +10,9 @@ def status(claim):
     records = [
         (p, read(p)) for p in (claim / "work/recorded-checks").glob("check-*.json")
     ]
+    from .budgets import effective_limits
+
+    limits = effective_limits(claim, assignment)
     rounds = list((claim / "work/batch-rounds").glob("*.json"))
     ranked = []
     for path, row in records:
@@ -28,13 +31,15 @@ def status(claim):
     return {
         "claim_id": claim.name,
         "rounds_used": len(rounds),
-        "rounds_limit": assignment.get("max_batch_rounds", 20),
-        "rounds_remaining": max(
-            0, assignment.get("max_batch_rounds", 20) - len(rounds)
-        ),
+        "rounds_limit": limits["max_batch_rounds"],
+        "rounds_remaining": max(0, limits["max_batch_rounds"] - len(rounds)),
         "checks": len(records),
         "compiler_invocations_upper_bound": sum(
-            r.get("compiler_invocations_upper_bound", assignment.get("official_internal_retry_bound", 4)) for _, r in records
+            r.get(
+                "compiler_invocations_upper_bound",
+                assignment.get("official_internal_retry_bound", 4),
+            )
+            for _, r in records
         )
         + max(
             0,

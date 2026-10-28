@@ -59,6 +59,17 @@ class ProfileEditor(ModalScreen):
             yield Static("", id="profile-allocation", markup=False)
             yield Label("Batch rounds per function · each round permits 1–8 candidates")
             yield Input(str(p.get("rounds", 20)), type="integer", id="profile-rounds")
+            yield Checkbox(
+                "Extend while improving",
+                value=p.get("extend_while_improving", True),
+                id="profile-extend",
+            )
+            yield Label(
+                "Improvement window · rounds without a new best before stopping"
+            )
+            yield Input(
+                str(p.get("improvement_window", 3)), type="integer", id="profile-window"
+            )
             yield Select(
                 [("Shared team budget", "shared"), ("Per-member budget", "per_member")],
                 value=p.get("budget_mode", "shared"),
@@ -113,6 +124,12 @@ class ProfileEditor(ModalScreen):
                     instances=int(self.query_one("#profile-instances", Input).value),
                     group_size=self.query_one("#profile-group", Select).value,
                     rounds=int(self.query_one("#profile-rounds", Input).value),
+                    extend_while_improving=self.query_one(
+                        "#profile-extend", Checkbox
+                    ).value,
+                    improvement_window=int(
+                        self.query_one("#profile-window", Input).value
+                    ),
                     budget_mode=self.query_one("#profile-budget-mode", Select).value,
                     model=self.query_one("#profile-model", Select).value,
                     effort=self.query_one("#profile-effort", Select).value,

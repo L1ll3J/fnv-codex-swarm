@@ -11,6 +11,7 @@ import threading
 import time
 
 from .board import Board
+from .budgets import member_round_limit
 from .group_check import digest, locked
 from .state import atomic, read, process_alive
 from .shared_status import status as shared_status
@@ -21,6 +22,32 @@ def append(path, value):
         output.write(json.dumps(value) + "\n")
         output.flush()
         os.fsync(output.fileno())
+
+
+def close_exhausted_checking(claim, deadline):
+    """Recheck the final batch and its improvement under the checker lock."""
+    directory = claim / "collaboration"
+    with locked(directory / "checker.lock"):
+        current = shared_status(claim)
+        if current["rounds_remaining"] > 0 or any(
+            read(path).get("state") == "running"
+            for path in (claim / "work/batch-rounds").glob("*.json")
+        ):
+            return None
+        atomic(
+            directory / "sealed.json",
+            {"at": dt.datetime.now(dt.timezone.utc).isoformat()},
+        )
+        until = min(deadline, time.monotonic() + 45)
+        atomic(
+            directory / "handoff-phase.json",
+            {
+                "checking_closed": True,
+                "seconds_allowed": max(0, until - time.monotonic()),
+                "best": current["best"],
+            },
+        )
+        return until
 
 
 def score(path):
@@ -366,9 +393,11 @@ def run(root, claim_id):
                     retain_rejection(root, claim_id, member["id"], evidence)
             records = list((claim / "work/recorded-checks").glob("check-*.json"))
             matched = any(score(path)[0] == 0 for path in records)
-            exhausted = (
-                len(list((claim / "work/batch-rounds").glob("*.json")))
-                >= assignment["max_batch_rounds"]
+            exhausted = len(
+                list((claim / "work/batch-rounds").glob("*.json"))
+            ) >= shared_status(claim)["rounds_limit"] and not any(
+                read(path).get("state") == "running"
+                for path in (claim / "work/batch-rounds").glob("*.json")
             )
             if (
                 exhausted
@@ -377,20 +406,8 @@ def run(root, claim_id):
                 and not signal_stop.is_set()
                 and handoff_until is None
             ):
-                with locked(directory / "checker.lock"):
-                    atomic(
-                        directory / "sealed.json",
-                        {"at": dt.datetime.now(dt.timezone.utc).isoformat()},
-                    )
-                    handoff_until = min(deadline, time.monotonic() + 45)
-                    atomic(
-                        directory / "handoff-phase.json",
-                        {
-                            "checking_closed": True,
-                            "seconds_allowed": max(0, handoff_until - time.monotonic()),
-                            "best": shared_status(claim)["best"],
-                        },
-                    )
+                handoff_until = close_exhausted_checking(claim, deadline)
+                exhausted = handoff_until is not None
             # Resume ordinary early completions in their existing conversations.
             if (
                 not exhausted
@@ -417,9 +434,10 @@ def run(root, claim_id):
                             (claim / "work/batch-rounds").glob(member["id"] + "-*.json")
                         )
                     )
-                    own_exhausted = (
-                        assignment.get("budget_mode") == "per_member"
-                        and used >= assignment["rounds_per_member"]
+                    own_exhausted = assignment.get(
+                        "budget_mode"
+                    ) == "per_member" and used >= member_round_limit(
+                        claim, assignment, member["id"]
                     )
                     if (
                         proc.poll() == 0

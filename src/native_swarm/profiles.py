@@ -37,6 +37,8 @@ def default_profile(workers=10, bands=None):
         "bands": list(BANDS if bands is None else bands),
         "rounds": 20,
         "budget_mode": "shared",
+        "extend_while_improving": True,
+        "improvement_window": 3,
     }
 
 
@@ -86,6 +88,11 @@ def validate_profiles(profiles, capacity=10):
         from .budgets import validate
 
         validate(p.get("rounds", 20), p.get("budget_mode", "shared"))
+        if type(p.get("extend_while_improving", True)) is not bool:
+            raise ValueError("Extend while improving must be on or off.")
+        window = p.get("improvement_window", 3)
+        if type(window) is not int or not 1 <= window <= 1000:
+            raise ValueError("Improvement window must be 1–1000 whole rounds.")
         total += p["instances"] * p["group_size"]
     if total > capacity:
         raise ValueError(
