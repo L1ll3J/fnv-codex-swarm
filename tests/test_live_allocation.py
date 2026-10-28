@@ -206,3 +206,180 @@ def test_legacy_acquire_ceiling_tracks_count_without_changing_model(
     b.save_profiles([{**b.profiles()[0], "instances": 5}, b.profiles()[1]])
     assert read(sol / "run-config.json") == {**original, "max_workers": 5}
     assert read(sol / "run-config-at-creation.json") == original
+
+
+def resume_fixture(tmp_path, monkeypatch):
+    b, sol, terra, team = fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr("native_swarm.backend.process_alive", lambda pid, root: bool(pid))
+    monkeypatch.setattr(b, "quota", Mock())
+    monkeypatch.setattr(b, "preflight", Mock(return_value={"open_claims": []}))
+    monkeypatch.setattr(b, "verify_template", Mock())
+    cfg = b.config
+    cfg["template_run"] = str(tmp_path / "template")
+    atomic(b.state / "config.json", cfg)
+    return b, sol, terra, team
+
+
+def test_resume_adds_only_missing_allocated_profile_without_restarting_existing(
+    tmp_path, monkeypatch
+):
+    b, sol, terra, team = resume_fixture(tmp_path, monkeypatch)
+    fresh = {**default_profile(1), "id": "new-team", "group_size": 2}
+    b.save_profiles([{**b.profiles()[0], "instances": 8}, fresh])
+    original = read(sol / "native-app-profile.json")
+    created = []
+
+    def create(cfg, template, account, profile):
+        root = tmp_path / profile["id"]
+        created.append(profile)
+        atomic(root / "native-app-profile.json", profile)
+        atomic(root / ".rolling-executor-owner.json", {"pid": 12})
+        cfg["managed_runs"].append(str(root))
+        cfg["current_run"] = str(root)
+        atomic(b.state / "config.json", cfg)
+
+    monkeypatch.setattr(b, "create_run", create)
+    assert "started 1 new profile" in b.start()
+    assert created == [fresh]
+    assert read(sol / "native-app-profile.json")["model"] == original["model"]
+    assert read(sol / "operator-control.json")["target_pool"] == 8
+    assert (terra / "operator-admissions-paused.json").exists()
+    assert (team / "operator-admissions-paused.json").exists()
+    b.preflight.assert_called_once_with(sol, require_idle=False)
+    assert "started" not in b.start()
+    assert created == [fresh]  # repeated Resume does not create a duplicate
+
+
+def test_resume_refuses_changed_identity_until_original_controller_stops(
+    tmp_path, monkeypatch
+):
+    import pytest
+    from native_swarm.backend import ControlError
+
+    b, sol, _, _ = resume_fixture(tmp_path, monkeypatch)
+    selected = b.profiles()
+    selected[0]["model"] = "gpt-6.1-terra"
+    b.save_profiles(selected)
+    create = Mock()
+    monkeypatch.setattr(b, "create_run", create)
+    with pytest.raises(ControlError, match="different model, reasoning or team size"):
+        b.start()
+    assert read(sol / "native-app-profile.json")["model"] == "gpt-6.1-sol"
+    create.assert_not_called()
+
+
+def test_resume_keeps_protected_stop_and_reports_actual_reason(tmp_path, monkeypatch):
+    import pytest
+    from native_swarm.backend import ControlError
+
+    b, sol, _, _ = resume_fixture(tmp_path, monkeypatch)
+    (sol / "STOP_NEW_CLAIMS").write_text("Submission integrity audit failed")
+    create = Mock()
+    monkeypatch.setattr(b, "create_run", create)
+    with pytest.raises(ControlError, match="Submission integrity audit failed"):
+        b.start()
+    assert (sol / "STOP_NEW_CLAIMS").read_text() == "Submission integrity audit failed"
+    create.assert_not_called()
+
+
+def test_resume_keeps_operator_drain_and_does_not_start_new_profiles(
+    tmp_path, monkeypatch
+):
+    import pytest
+    from native_swarm.backend import ControlError
+
+    b, sol, _, _ = resume_fixture(tmp_path, monkeypatch)
+    atomic(sol / "operator-drain.json", {"reason": "Finish the current run"})
+    create = Mock()
+    monkeypatch.setattr(b, "create_run", create)
+    with pytest.raises(ControlError, match="Finish the current run"):
+        b.start()
+    assert read(sol / "operator-drain.json")["reason"] == "Finish the current run"
+    create.assert_not_called()
+
+
+def test_resume_checks_capacity_before_creating_missing_profile(tmp_path, monkeypatch):
+    import pytest
+
+    b, _, _, _ = resume_fixture(tmp_path, monkeypatch)
+    cfg = b.config
+    cfg["profiles"].append({**default_profile(1), "id": "over-capacity"})
+    atomic(b.state / "config.json", cfg)
+    create = Mock()
+    monkeypatch.setattr(b, "create_run", create)
+    with pytest.raises(ValueError, match="capacity"):
+        b.start()
+    create.assert_not_called()
+
+
+def test_resume_does_not_start_missing_profile_with_orphaned_workers(
+    tmp_path, monkeypatch
+):
+    import pytest
+    from native_swarm.backend import ControlError
+
+    b, _, _, team = resume_fixture(tmp_path, monkeypatch)
+    (team / ".rolling-executor-owner.json").unlink()
+    atomic(team / "rolling-executor/journal.json", {"jobs": {"old": {"pid": 42}}})
+    create = Mock()
+    monkeypatch.setattr(b, "create_run", create)
+    with pytest.raises(ControlError, match="Workers without an active controller"):
+        b.start()
+    create.assert_not_called()
+
+
+def test_resume_missing_profile_preflight_failure_preserves_existing_pause(
+    tmp_path, monkeypatch
+):
+    import pytest
+    from native_swarm.backend import ControlError
+
+    b, sol, _, team = resume_fixture(tmp_path, monkeypatch)
+    (team / ".rolling-executor-owner.json").unlink()
+    atomic(sol / "operator-admissions-paused.json", {"reason": "manual pause"})
+    b.preflight.side_effect = ControlError("Readiness unavailable")
+    create = Mock()
+    monkeypatch.setattr(b, "create_run", create)
+    with pytest.raises(ControlError, match="Readiness unavailable"):
+        b.start()
+    assert read(sol / "operator-admissions-paused.json")["reason"] == "manual pause"
+    create.assert_not_called()
+
+
+def test_resume_rejects_duplicate_live_profile_owners(tmp_path, monkeypatch):
+    import pytest
+    from native_swarm.backend import ControlError
+
+    b, sol, _, team = resume_fixture(tmp_path, monkeypatch)
+    atomic(team / "native-app-profile.json", read(sol / "native-app-profile.json"))
+    create = Mock()
+    monkeypatch.setattr(b, "create_run", create)
+    with pytest.raises(ControlError, match="Multiple active controllers own profile"):
+        b.start()
+    create.assert_not_called()
+
+
+def test_resume_failed_multi_profile_start_pauses_only_new_controllers(
+    tmp_path, monkeypatch
+):
+    import pytest
+    from native_swarm.backend import ControlError
+
+    b, sol, terra, team = resume_fixture(tmp_path, monkeypatch)
+    for root in (terra, team):
+        (root / ".rolling-executor-owner.json").unlink()
+    atomic(sol / "operator-admissions-paused.json", {"reason": "manual pause"})
+    new_run = tmp_path / "new-terra"
+
+    def create(cfg, template, account, profile):
+        if profile["id"] == "team":
+            raise ControlError("Preparation unavailable")
+        cfg["managed_runs"].append(str(new_run))
+        cfg["current_run"] = str(new_run)
+        atomic(b.state / "config.json", cfg)
+
+    monkeypatch.setattr(b, "create_run", create)
+    with pytest.raises(ControlError, match="Preparation unavailable"):
+        b.start()
+    assert read(sol / "operator-admissions-paused.json")["reason"] == "manual pause"
+    assert read(new_run / "operator-admissions-paused.json")["reason"] == "profile start incomplete"
