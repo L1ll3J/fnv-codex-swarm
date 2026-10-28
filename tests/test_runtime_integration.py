@@ -33,6 +33,7 @@ def test_real_template_generation_preserves_original_checker(tmp_path, group_siz
         "ingest.py",
         "recorded_fnv_check_v2.py",
         "validate_submit.py",
+        "audit.py",
         "evidence.py",
         "attempt_history.py",
         "recorded_check_with_history.py",
@@ -61,6 +62,7 @@ def test_real_template_generation_preserves_original_checker(tmp_path, group_siz
         in (tmp_path / "recorded_fnv_check_v2.py").read_text()
     )
     assert "accepted_match" in (tmp_path / "validate_submit.py").read_text()
+    assert "accepted_match" in (tmp_path / "audit.py").read_text()
     assert (
         "if not resolution_ready(p):return False"
         in (tmp_path / "ingest.py").read_text()
