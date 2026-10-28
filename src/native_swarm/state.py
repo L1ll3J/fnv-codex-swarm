@@ -140,9 +140,9 @@ class Projection:
                         else "expired lease"
                     )
                 records = []
-                for record in sorted(
-                    (claim / "work/recorded-checks").glob("check-*.json")
-                ):
+                from .progress import receipt_paths
+
+                for record in receipt_paths(claim):
                     value = self.load(record)
                     records.append(value)
                 assignment = self.load(claim / "assignment.json")

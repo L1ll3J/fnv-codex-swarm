@@ -31,10 +31,20 @@ def supplied_hashes(claim, assignment):
     return hashes
 
 
+def receipt_paths(claim):
+    def sequence(path):
+        number = path.stem.removeprefix("check-")
+        return (int(number) if number.isdecimal() else float("inf"), path.name)
+
+    return sorted(
+        (Path(claim) / "work/recorded-checks").glob("check-*.json"), key=sequence
+    )
+
+
 def checked_progress(claim, records=None, assignment=None):
     claim = Path(claim)
     assignment = read(claim / "assignment.json") if assignment is None else assignment
-    paths = sorted((claim / "work/recorded-checks").glob("check-*.json"))
+    paths = receipt_paths(claim)
     if records is None:
         records = [read(path) for path in paths]
     supplied = supplied_hashes(claim, assignment)

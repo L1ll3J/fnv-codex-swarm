@@ -114,3 +114,39 @@ def test_later_better_seed_does_not_revoke_admitted_rounds(tmp_path):
     receipt(tmp_path, 3, 5, "seed")
     assert effective_limits(tmp_path) == limits
     assert [e["check"] for e in checked_progress(tmp_path)["events"]] == [2]
+
+
+def test_numeric_receipt_order_after_999_preserves_window_and_display(tmp_path):
+    from native_swarm.budgets import effective_limits
+
+    claim = tmp_path / "claims/c"
+    atomic(claim / "claim.json", {"address": "0x123", "size": 900})
+    atomic(
+        claim / "assignment.json",
+        {
+            "max_batch_rounds": 1000,
+            "max_plain_checks": 8000,
+            "max_compiler_invocations": 32000,
+            "extend_while_improving": True,
+            "improvement_window": 3,
+        },
+    )
+    receipt(claim, 1, 100, "baseline")
+    improved = receipt(claim, 999, 10, "improved")
+    worse = receipt(claim, 1000, 50, "worse")
+    for number, path in ((999, improved), (1000, worse)):
+        atomic(
+            claim / f"work/batch-rounds/{number}.json",
+            {
+                "round_number": number,
+                "batch_id": str(number),
+                "results": [{"manifest": str(path)}],
+            },
+        )
+    p = checked_progress(claim)
+    assert [e["manifest"] for e in p["events"]] == [str(improved)]
+    assert effective_limits(claim)["max_batch_rounds"] == 1002
+    row = Projection().snapshot([tmp_path], tmp_path / "quota")["rows"][0]
+    assert row["best"] == 10
+    assert row["checks_since_best"] == 1
+    assert [e["manifest"] for e in row["best_history"]] == [str(improved)]
