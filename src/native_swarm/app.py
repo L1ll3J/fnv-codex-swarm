@@ -231,7 +231,7 @@ class SwarmApp(App):
                         id="bands",
                     )
                     yield Static(
-                        "Model, reasoning, priority and per-profile brackets are under Worker profiles.\n20 rounds/function · 1–8 candidates/round\nUsage policy applies to controllers created by this release. Older/imported controllers retain their policy until drained.\nPreviously attempted functions are eligible. Original checker and submission gates stay in place.",
+                        "Model, reasoning, priority and per-profile brackets are under Worker profiles.\nProfile-defined rounds and optional rolling improvement window · 1–8 candidates/round\nUsage policy applies to controllers created by this release. Older/imported controllers retain their policy until drained.\nPreviously attempted functions are eligible. Original checker and submission gates stay in place.",
                         markup=False,
                     )
                     policy = {**DEFAULT_POLICY, **cfg.get("usage_policy", {})}
