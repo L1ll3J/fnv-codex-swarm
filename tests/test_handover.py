@@ -164,3 +164,38 @@ def test_stable_process_handle_does_not_signal_changed_identity(
         terminate_controller(123, root, owner)
     send.assert_not_called()
     close.assert_called_once_with(456)
+
+
+def test_withdrawn_preparation_without_claim_allows_idle_retirement(
+    tmp_path, monkeypatch
+):
+    state, root, terminate = setup_idle(tmp_path, monkeypatch)
+    atomic(
+        root / "rolling-executor/journal.json",
+        {"jobs": {"withdrawn": {"state": "allocation_withdrawn_no_launch"}}},
+    )
+    retire_idle(root, state)
+    terminate.assert_called_once_with(123, root, {"pid": 123})
+
+
+@pytest.mark.parametrize("remaining", ["worker", "claim"])
+def test_withdrawn_preparation_still_checks_workers_and_claims(
+    tmp_path, monkeypatch, remaining
+):
+    state, root, terminate = setup_idle(tmp_path, monkeypatch)
+    atomic(
+        root / "rolling-executor/journal.json",
+        {
+            "jobs": {
+                "withdrawn": {
+                    "state": "allocation_withdrawn_no_launch",
+                    "pid": 123 if remaining == "worker" else None,
+                }
+            }
+        },
+    )
+    if remaining == "claim":
+        atomic(root / "claims/open/claim.json", {"claim_id": "open"})
+    with pytest.raises(RuntimeError, match="worker process|no acknowledged closure"):
+        retire_idle(root, state)
+    terminate.assert_not_called()

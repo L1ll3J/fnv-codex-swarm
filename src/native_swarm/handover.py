@@ -18,6 +18,7 @@ TERMINAL_JOBS = {
     "prepare_deferred_cooldown",
     "band_unavailable_cooldown_no_launch",
     "fresh_unavailable_cooldown_no_launch",
+    "allocation_withdrawn_no_launch",
 }
 
 
