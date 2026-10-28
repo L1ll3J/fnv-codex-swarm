@@ -9,7 +9,7 @@ def ordered_functions(call, bands, priority, band_for_size):
         while True:
             query = {
                 "band": band,
-                "order": "size",
+                "order": "returned" if priority == "recently returned" else "size",
                 "limit": 500,
                 "exclude_reported": True,
             }
@@ -34,6 +34,12 @@ def ordered_functions(call, bands, priority, band_for_size):
                 )
             seen.add(str(cursor))
     unique = {str(r["address"]): r for r in rows}
+    if priority == "recently returned":
+        # Preserve server order within equal timestamps; dated returns precede
+        # never-returned entries. ISO timestamps use the service's UTC format.
+        return sorted(
+            unique.values(), key=lambda r: r.get("back_in_pool_at") or "", reverse=True
+        )
     return sorted(
         unique.values(),
         key=lambda r: (r["size"], str(r["address"])),

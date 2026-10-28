@@ -18,6 +18,7 @@ FILES = (
     "function_index.json",
     "fnvdecomp_symbols.json",
     "compiler_tips.md",
+    "large_functions.md",
 )
 MAX_AGE = 300
 # Only compilation control-flow changes require an accounting compatibility audit.
@@ -53,17 +54,42 @@ def tree(root):
 
 
 def audit(checker):
-    for name, expected in COMPILE_COMPONENTS.items():
-        if not (checker / name).is_file() or digest(checker / name) != expected:
-            raise ValueError(
-                "New compiler adapter requires accounting compatibility review: " + name
-            )
-    key = (digest(checker / "fnvcheck.py"), digest(checker / "fc_check.py"))
-    if key not in AUDITS:
+    names = ("fnvcheck.py", "fc_check.py", "fc_common.py", "msvc9.py")
+    if any(not (checker / name).is_file() for name in names):
+        raise ValueError("Missing official compiler adapter; no admission")
+    key = tuple(digest(checker / name) for name in names)
+    known = {
+        (
+            *pair,
+            COMPILE_COMPONENTS["fc_common.py"],
+            COMPILE_COMPONENTS["msvc9.py"],
+        ): bound
+        for pair, bound in AUDITS.items()
+    }
+    known[
+        (
+            "a4e945c44b49f02ab007a3e4ae4cafc5896a2ec2ca3147d048017bb578859cfb",
+            "8a3e6353bc82ab3537a4967d5702e6139654eb2b6f75851fbf91a684cbd0c78b",
+            "0e3628d9b9ad27fd4adf9c8218c0a569e0e27c294e11ffe6f377767ec9962db5",
+            COMPILE_COMPONENTS["msvc9.py"],
+        )
+    ] = 20
+    # 28 October: VC8 pack selection, all-code RTM fallback and whole-function
+    # diagnostics. Each compiler retains the initial call plus three repair
+    # iterations (at most three calls each); two compilers => at most 20.
+    known[
+        (
+            "190fa74a97f3696f9fe7e338ad1db55512a053b10ed5e9b4b933bd3a2cc1acab",
+            "855da0215bf0281d39da8adcb17c3cb880f3f0c8b1efc898ff3c2be047fde69b",
+            "837ddc3e4545914ae15bc599ccf880ad06efd35f5135d80a14c09c1084796725",
+            "6310083197c8fbd8236145f6a5ac6c50d1edbf1f8aa703b86abd9a94c3280692",
+        )
+    ] = 20
+    if key not in known:
         raise ValueError(
             "New official checker downloaded; compilation accounting compatibility review required before admission"
         )
-    return AUDITS[key]
+    return known[key]
 
 
 def validate(snapshot):
@@ -85,6 +111,9 @@ def validate(snapshot):
         for name, value in manifest["files"].items()
     ):
         raise ValueError("Official data generation changed")
+    from .toolchains import validate as validate_toolchains
+
+    validate_toolchains(manifest.get("toolchains", {}))
     return directory
 
 
@@ -125,7 +154,7 @@ def current(root, download=None, *, now=None, force=False, compatibility=audit):
                     raise ValueError("Invalid official function index")
                 if not json.loads((stage / "fnvdecomp_symbols.json").read_text()):
                     raise ValueError("Empty official symbol data")
-                for name in ("compiler_tips.md", "agents.md"):
+                for name in ("compiler_tips.md", "large_functions.md", "agents.md"):
                     if not (stage / name).read_text().strip():
                         raise ValueError("Empty official guidance")
                 unpack = stage / ".unpack"
@@ -146,6 +175,10 @@ def current(root, download=None, *, now=None, force=False, compatibility=audit):
                     "checker": tree(stage / "fnvcheck"),
                     "compiler_calls_per_flag_set": bound,
                 }
+                if bound >= 20:
+                    from .toolchains import discover
+
+                    manifest["toolchains"] = discover(state)
                 identifier = hashlib.sha256(
                     json.dumps(manifest, sort_keys=True).encode()
                 ).hexdigest()
@@ -184,6 +217,13 @@ def attach(root, claim_id, assignment):
     snapshot = read(claim / "official-tools.json") or current(root)
     directory = validate(snapshot)
     pack = json.loads((claim / "pack/pack.json").read_text())
+    compiler = pack.get("compiler", "sp1")
+    if compiler not in ("sp1", "vc8"):
+        raise ValueError("Unsupported official pack compiler: " + str(compiler))
+    if compiler == "vc8" and "vc8" not in snapshot["manifest"].get("toolchains", {}):
+        raise ValueError(
+            "Install official Visual C++ 2005 SP1 before preparing this VC8 assignment"
+        )
     target = int(pack["address"], 16)
     if target not in {
         int(r["address"], 16)
@@ -220,6 +260,9 @@ def attach(root, claim_id, assignment):
         "function_index": str(directory / "function_index.json"),
         "symbols": str(directory / "fnvdecomp_symbols.json"),
         "compiler_tips": str(directory / "compiler_tips.md"),
+        "large_functions": str(directory / "large_functions.md")
+        if (directory / "large_functions.md").is_file()
+        else None,
         "official_guidance": str(directory / "agents.md"),
         "game_image": str(Path.home() / "fnvdecomp/game/FalloutNV.exe"),
         "environment_script": str(Path.home() / "fnvdecomp/env.sh"),
@@ -240,17 +283,31 @@ def context(assignment):
             p.name: digest(p) for p in (directory / "fnvcheck").glob("*.py")
         },
         "bound": assignment["official_internal_retry_bound"],
+        "toolchains": snapshot["manifest"].get("toolchains", {}),
+        "full_diagnostics": "ap.add_argument('--full-diff'"
+        in (directory / "fnvcheck/fnvcheck.py").read_text(),
     }
 
 
 def environment(value, claim):
     directory = value["directory"]
+    compilers = value.get("toolchains", {})
+    variables = []
+    if compilers:
+        variables.append("FNV_MSVC9_ROOT=" + compilers["sp1"]["root"])
+    # Never silently enable an unrecorded ambient fallback on a legacy assignment.
+    variables.append("FNVCHECK_RTM_ROOT=" + compilers.get("rtm", {}).get("root", ""))
+    variables.append("FNVCHECK_VC8_ROOT=" + compilers.get("vc8", {}).get("root", ""))
+    # The official CLI selects VC8 from pack.json. Ambient overrides must never
+    # silently select a different compiler for ordinary or historical packs.
+    variables.append("FNVCHECK_COMPILER=sp1")
     return [
         "PYTHONDONTWRITEBYTECODE=1",
         "FNVCHECK_TOOLS=" + str(value["checker"]),
         "FNVCHECK_INDEX=" + str(directory / "function_index.json"),
         "FNVCHECK_SYMBOLS=" + str(directory / "fnvdecomp_symbols.json"),
         "FNVCHECK_CACHE=" + str(Path(claim) / "work/tool-cache"),
+        *variables,
     ]
 
 

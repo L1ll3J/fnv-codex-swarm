@@ -44,10 +44,22 @@ def configure(root):
         "'recorded-check',str(BASE/'.venv/bin/python')",
         "'recorded-check','env',*(environment(tool_context,claim) if tool_context else []),str(BASE/'.venv/bin/python')",
     )
+    # New generations support complete diagnostic artifacts without additional
+    # compiler calls. Leave legacy assignments on their original CLI options.
+    replace_once(
+        recorder,
+        "str(snapshot),'--json']",
+        "str(snapshot),'--json',*(['--full-diff',str(records/('diff-%03d.txt'%n)),'--slots'] if tool_context and tool_context.get('full_diagnostics') else [])]",
+    )
+    replace_once(
+        recorder,
+        "'checker_result':check,'log_path':str(log)",
+        "'checker_result':check,'full_diff_path':str(records/('diff-%03d.txt'%n)) if (records/('diff-%03d.txt'%n)).is_file() else None,'log_path':str(log)",
+    )
     replace_once(
         recorder,
         "'schema':'fnv-recorded-check/2'",
-        "'schema':'fnv-recorded-check/2','official_tools_id':assignment.get('official_tools',{}).get('id')",
+        "'schema':'fnv-recorded-check/2','official_tools_id':assignment.get('official_tools',{}).get('id'),'compiler_toolchains':tool_context.get('toolchains',{}) if tool_context else {}",
     )
     # Recorder wrappers must bind to the actual copied, adapted recorder.
     import hashlib
@@ -152,8 +164,14 @@ def configure(root):
         "'accepted_flags':accepted_match(x.returncode,log,manifest)[1],'official_tools_id':a.get('official_tools',{}).get('id'),'checked_at':datetime.datetime.now",
     )
     text = text.replace(
+        _local("pathlib.Path('$FNV_ROOT/tools/msvc9/VC/bin/cl.exe')"),
+        _local(
+            "(pathlib.Path(tool_context['toolchains']['sp1']['root'])/'VC/bin/cl.exe' if tool_context and tool_context.get('toolchains',{}).get('sp1') else pathlib.Path('$FNV_ROOT/tools/msvc9/VC/bin/cl.exe'))"
+        ),
+    )
+    text = text.replace(
         "versions={str(q):digest(q) for q in version_files}",
-        "version_files += [tool_context['directory']/n for n in a['official_tools']['manifest']['files']] if tool_context else []\nversions={str(q):digest(q) for q in version_files}",
+        "version_files += [tool_context['directory']/n for n in a['official_tools']['manifest']['files']] if tool_context else []\nfrom native_swarm.toolchains import files as compiler_files\nversion_files += [pathlib.Path(p) for p in compiler_files(tool_context.get('toolchains',{}))] if tool_context else []\nversions={str(q):digest(q) for q in version_files}",
     )
     validator.write_text(text)
     for path in root.glob("*.py"):

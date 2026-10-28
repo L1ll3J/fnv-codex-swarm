@@ -168,3 +168,34 @@ def test_proof_timeout_is_displayed_by_dialog_handler(monkeypatch):
     event = SimpleNamespace(stop=lambda: None, button=SimpleNamespace(id="flag-proof"))
     asyncio.run(FlagEditor.on_button_pressed(dialog, event))
     assert messages and "timed out" in messages[0]
+
+
+def test_rtm_proof_uses_selected_custom_compiler(tmp_path, monkeypatch):
+    from native_swarm.checker_result import RTM_SUFFIX
+
+    claim, source, report, calls, service, invoke = setup_claim(tmp_path, monkeypatch)
+    selected = flag_proof.context({})
+    compiler = tmp_path / "custom-compiler/VC/bin/cl.exe"
+    compiler.parent.mkdir(parents=True)
+    compiler.write_bytes(b"compiler")
+    selected["toolchains"] = {
+        "sp1": {
+            "root": str(compiler.parents[2]),
+            "files": {"VC/bin/cl.exe": flag_proof.digest(compiler)},
+        }
+    }
+    monkeypatch.setattr(flag_proof, "context", lambda _: selected)
+
+    def rtm(*args, **kwargs):
+        result = invoke(*args, **kwargs)
+        result.stdout = result.stdout.replace(
+            "MATCH  (under", "MATCH" + RTM_SUFFIX + "  (under"
+        )
+        return result
+
+    proof = flag_proof.prepare(report, source, ["/Od"], call=service, invoke=rtm)
+    assert str(compiler) in proof["checked_versions"]
+    assert (
+        str(Path.home() / "fnvdecomp/tools/msvc9/VC/bin/cl.exe")
+        not in proof["checked_versions"]
+    )

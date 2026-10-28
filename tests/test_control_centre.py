@@ -46,6 +46,40 @@ def test_catalog_cursor_loop_fails_without_any_claim():
         ordered_functions(call, ["<=255"], "smallest", lambda _: "<=255")
 
 
+def test_recently_returned_priority_combines_brackets_before_ranking():
+    call = Mock(
+        side_effect=[
+            {
+                "functions": [
+                    {"address": "0x1", "size": 100},
+                    {
+                        "address": "0x2",
+                        "size": 200,
+                        "back_in_pool_at": "2026-10-27T01:00:00Z",
+                    },
+                ]
+            },
+            {
+                "functions": [
+                    {
+                        "address": "0x3",
+                        "size": 700,
+                        "back_in_pool_at": "2026-10-28T01:00:00Z",
+                    }
+                ]
+            },
+        ]
+    )
+    rows = ordered_functions(
+        call,
+        ["<=255", "512-1K"],
+        "recently returned",
+        lambda n: "<=255" if n <= 255 else "512-1K",
+    )
+    assert [r["address"] for r in rows] == ["0x3", "0x2", "0x1"]
+    assert all(c.args[1]["order"] == "returned" for c in call.call_args_list)
+
+
 def test_queue_is_targeted_reserved_once_and_preserves_uncertainty(tmp_path):
     store = OperatorStore(tmp_path)
     atomic(

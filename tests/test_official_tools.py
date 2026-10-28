@@ -41,7 +41,7 @@ def generation(root, download, now=100):
 def test_refresh_ttl_pinning_and_failed_update(tmp_path):
     download = Downloads()
     first = generation(tmp_path, download)
-    assert len(download.calls) == 5
+    assert len(download.calls) == 6
     assert generation(tmp_path, download, 101) == first
     download.tip = "guidance v2"
     second = generation(tmp_path, download, 401)
@@ -122,3 +122,14 @@ def test_official_import_does_not_mutate_generation(tmp_path):
     assert result.returncode == 0
     assert not list(value["checker"].rglob("__pycache__"))
     tools.validate(snapshot)
+
+
+def test_vc8_assignment_requires_a_recorded_compiler(tmp_path, monkeypatch):
+    snapshot = generation(tmp_path, Downloads())
+    atomic(
+        tmp_path / "claims/claim/pack/pack.json",
+        {"address": "0x00401000", "flags": ["/O2"], "compiler": "vc8"},
+    )
+    monkeypatch.setattr(tools, "current", lambda *_args, **_kw: snapshot)
+    with pytest.raises(ValueError, match="Visual C\\+\\+ 2005"):
+        tools.attach(tmp_path, "claim", {"max_plain_checks": 16})

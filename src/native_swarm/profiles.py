@@ -20,7 +20,7 @@ MODELS = {
         "rates": (10, 1, 12.5, 50),
     },
 }
-PRIORITIES = ("random", "smallest", "largest")
+PRIORITIES = ("random", "smallest", "largest", "recently returned")
 BANDS = ("<=255", "256-511", "512-1K", "1K-4K", "4K+")
 
 
@@ -67,7 +67,7 @@ def validate_profiles(profiles, capacity=10):
         ):
             raise ValueError("Choose a supported model and reasoning level.")
         if p.get("priority") not in PRIORITIES:
-            raise ValueError("Choose random, smallest or largest.")
+            raise ValueError("Choose random, smallest, largest or recently returned.")
         bands = p.get("bands", list(BANDS))
         if (
             not isinstance(bands, list)
