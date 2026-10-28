@@ -24,6 +24,32 @@ def append(path, value):
         os.fsync(output.fileno())
 
 
+def close_exhausted_checking(claim, deadline):
+    """Recheck the final batch and its improvement under the checker lock."""
+    directory = claim / "collaboration"
+    with locked(directory / "checker.lock"):
+        current = shared_status(claim)
+        if current["rounds_remaining"] > 0 or any(
+            read(path).get("state") == "running"
+            for path in (claim / "work/batch-rounds").glob("*.json")
+        ):
+            return None
+        atomic(
+            directory / "sealed.json",
+            {"at": dt.datetime.now(dt.timezone.utc).isoformat()},
+        )
+        until = min(deadline, time.monotonic() + 45)
+        atomic(
+            directory / "handoff-phase.json",
+            {
+                "checking_closed": True,
+                "seconds_allowed": max(0, until - time.monotonic()),
+                "best": current["best"],
+            },
+        )
+        return until
+
+
 def score(path):
     row = read(path)
     check = row.get("checker_result", {})
@@ -380,20 +406,8 @@ def run(root, claim_id):
                 and not signal_stop.is_set()
                 and handoff_until is None
             ):
-                with locked(directory / "checker.lock"):
-                    atomic(
-                        directory / "sealed.json",
-                        {"at": dt.datetime.now(dt.timezone.utc).isoformat()},
-                    )
-                    handoff_until = min(deadline, time.monotonic() + 45)
-                    atomic(
-                        directory / "handoff-phase.json",
-                        {
-                            "checking_closed": True,
-                            "seconds_allowed": max(0, handoff_until - time.monotonic()),
-                            "best": shared_status(claim)["best"],
-                        },
-                    )
+                handoff_until = close_exhausted_checking(claim, deadline)
+                exhausted = handoff_until is not None
             # Resume ordinary early completions in their existing conversations.
             if (
                 not exhausted

@@ -234,3 +234,167 @@ def test_independent_per_member_profile_has_same_rolling_allowance(tmp_path):
             },
         )
     assert effective_limits(tmp_path)["max_batch_rounds"] == 5
+
+
+@pytest.mark.parametrize("mode", ["shared", "per_member"])
+@pytest.mark.parametrize("size", [1, 2, 3])
+@pytest.mark.parametrize("window", [1, 2, 3])
+def test_real_team_policy_and_receipts_extend_every_supported_budget_mode(
+    tmp_path, mode, size, window
+):
+    assignment = allocation(
+        {
+            "rounds": 2,
+            "budget_mode": mode,
+            "group_size": size,
+            "improvement_window": window,
+        }
+    )
+    atomic(tmp_path / "assignment.json", assignment)
+    # A real initial checked score establishes a baseline, then peer-1 improves.
+    for number, score in ((1, 10), (2, 9)):
+        receipt = tmp_path / f"work/recorded-checks/check-{number:03d}.json"
+        atomic(
+            receipt,
+            {
+                "source_sha256": str(number),
+                "checker_exit_code": 1,
+                "checker_result": {"status": "wip", "ndiff_insn": score},
+            },
+        )
+        atomic(
+            tmp_path / f"work/batch-rounds/round-{number}.json",
+            {
+                "round_number": number,
+                "batch_id": f"peer-1-round-{number}",
+                "state": "complete",
+                "results": [{"manifest": str(receipt)}],
+            },
+        )
+    effective = effective_limits(tmp_path)
+    mode = assignment["budget_mode"]
+    base = assignment["max_batch_rounds"]
+    expected = max(base, 2 + window) if mode == "shared" else base + window
+    assert effective["max_batch_rounds"] == expected
+    assert effective["max_plain_checks"] == expected * 8
+    assert effective["max_compiler_invocations"] == expected * 8 * 4
+    assert effective["member_round_limits"] == (
+        {"peer-1": 2 + window} if mode == "per_member" else {}
+    )
+
+
+def test_final_seal_rechecks_improvement_after_waiting_for_checker_lock(tmp_path):
+    import threading
+    import time
+
+    from native_swarm.group import close_exhausted_checking
+    from native_swarm.group_check import locked
+    from native_swarm.shared_status import status
+
+    assignment = allocation({"rounds": 2, "budget_mode": "shared", "group_size": 2})
+    atomic(tmp_path / "assignment.json", assignment)
+    atomic(
+        tmp_path / "work/recorded-checks/check-001.json",
+        {
+            "source_sha256": "baseline",
+            "checker_exit_code": 1,
+            "checker_result": {"status": "wip", "ndiff_insn": 10},
+        },
+    )
+    for number in (1, 2):
+        atomic(
+            tmp_path / f"work/batch-rounds/round-{number}.json",
+            {
+                "round_number": number,
+                "batch_id": f"peer-1-round-{number}",
+                "state": "complete" if number == 1 else "running",
+                "results": [],
+            },
+        )
+    directory = tmp_path / "collaboration"
+    directory.mkdir()
+    assert status(tmp_path)["rounds_remaining"] == 0  # stale supervisor observation
+    started = threading.Event()
+    results, failures = [], []
+
+    def seal():
+        started.set()
+        try:
+            results.append(close_exhausted_checking(tmp_path, time.monotonic() + 60))
+        except (OSError, ValueError, TypeError) as error:
+            failures.append(error)
+
+    with locked(directory / "checker.lock"):
+        worker = threading.Thread(target=seal)
+        worker.start()
+        assert started.wait(2)
+        receipt = tmp_path / "work/recorded-checks/check-002.json"
+        atomic(
+            receipt,
+            {
+                "source_sha256": "improved",
+                "checker_exit_code": 1,
+                "checker_result": {"status": "wip", "ndiff_insn": 9},
+            },
+        )
+        atomic(
+            tmp_path / "work/batch-rounds/round-2.json",
+            {
+                "round_number": 2,
+                "batch_id": "peer-1-round-2",
+                "state": "complete",
+                "results": [{"manifest": str(receipt)}],
+            },
+        )
+    worker.join(timeout=2)
+    assert not worker.is_alive() and not failures
+    assert results == [None]
+    assert not (directory / "sealed.json").exists()
+    assert status(tmp_path)["rounds_remaining"] == 3
+
+
+@pytest.mark.parametrize("mode", ["shared", "per_member"])
+@pytest.mark.parametrize("window", [1, 2, 3])
+def test_real_peer_interleaving_resets_own_or_shared_window(tmp_path, mode, window):
+    assignment = allocation(
+        {
+            "rounds": 2,
+            "budget_mode": mode,
+            "group_size": 2,
+            "improvement_window": window,
+        }
+    )
+    atomic(tmp_path / "assignment.json", assignment)
+    for number, member, score in (
+        (1, "peer-1", 10),
+        (2, "peer-2", 9),
+        (3, "peer-1", 8),
+        (4, "peer-2", 8),
+    ):
+        receipt = tmp_path / f"work/recorded-checks/check-{number:03d}.json"
+        atomic(
+            receipt,
+            {
+                "source_sha256": str(number),
+                "checker_exit_code": 1,
+                "checker_result": {"status": "wip", "ndiff_insn": score},
+            },
+        )
+        atomic(
+            tmp_path / f"work/batch-rounds/round-{number}.json",
+            {
+                "round_number": number,
+                "batch_id": f"{member}-round-{number}",
+                "state": "complete",
+                "results": [{"manifest": str(receipt)}],
+            },
+        )
+    effective = effective_limits(tmp_path)
+    if mode == "shared":
+        assert effective["max_batch_rounds"] == 3 + window
+    else:
+        assert effective["member_round_limits"] == {
+            "peer-1": 2 + window,
+            "peer-2": max(2, 1 + window),
+        }
+        assert effective["max_batch_rounds"] == 4 + window + max(0, window - 1)

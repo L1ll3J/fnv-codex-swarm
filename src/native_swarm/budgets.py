@@ -113,9 +113,11 @@ def effective_limits(claim, assignment=None):
         "max_compiler_invocations": base["max_compiler_invocations"]
         + extra * 8 * assignment.get("official_internal_retry_bound", 4),
         "member_round_limits": {
-            key: max(assignment.get("rounds_per_member", 0), value)
+            key: max(assignment["rounds_per_member"], value)
             for key, value in member_limits.items()
-        },
+        }
+        if assignment.get("budget_mode") == "per_member"
+        else {},
     }
 
 
